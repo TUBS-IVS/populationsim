@@ -7,7 +7,11 @@ import pandas as pd
 
 from populationsim.core.config import setting
 from populationsim.balancing.balancers import np_simul_balancer_py
-from populationsim.balancing.balancers_numba import np_simul_balancer_numba
+from populationsim.balancing.balancers_numba import (
+    log_kernel_choice_once,
+    np_simul_balancer_numba,
+    np_simul_balancer_numba_fast,
+)
 from populationsim.balancing.constants import (
     MIN_CONTROL_VALUE,
     MIN_IMPORTANCE,
@@ -36,6 +40,7 @@ class SimultaneousListBalancer:
         total_hh_control_col,
         use_numba,
         numba_precision,
+        fast_paths=False,
     ):
         """
 
@@ -54,6 +59,10 @@ class SimultaneousListBalancer:
             for use in sub_controls_df column names
         total_hh_control_col : str
             name of the total_hh control column
+        fast_paths : bool
+            fork setting FAST_PATHS: with numba on, use
+            ``np_simul_balancer_numba_fast``, whose result is identical bit for
+            bit (default False: upstream kernel)
         """
         assert isinstance(incidence_table, pd.DataFrame)
         assert len(parent_weights.index) == len(incidence_table.index)
@@ -83,7 +92,15 @@ class SimultaneousListBalancer:
             total_hh_control_col
         )
 
-        self.balancer = np_simul_balancer_numba if use_numba else np_simul_balancer_py
+        self.fast_paths = bool(fast_paths)
+        if self.fast_paths:
+            log_kernel_choice_once(use_numba)
+        if use_numba and self.fast_paths:
+            self.balancer = np_simul_balancer_numba_fast
+        else:
+            self.balancer = (
+                np_simul_balancer_numba if use_numba else np_simul_balancer_py
+            )
         self.numba_precision = numba_precision
 
     def balance(self):

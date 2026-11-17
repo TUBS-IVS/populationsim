@@ -6,7 +6,11 @@ import numpy as np
 import pandas as pd
 
 from populationsim.balancing.balancers import np_balancer_py
-from populationsim.balancing.balancers_numba import np_balancer_numba
+from populationsim.balancing.balancers_numba import (
+    log_kernel_choice_once,
+    np_balancer_numba,
+    np_balancer_numba_fast,
+)
 from populationsim.balancing.constants import (
     MAX_INT,
     MIN_IMPORTANCE,
@@ -40,6 +44,7 @@ class ListBalancer:
         max_iterations,
         use_numba,
         numba_precision,
+        fast_paths=False,
     ):
         """
         Parameters
@@ -64,6 +69,9 @@ class ListBalancer:
             whether to use numba for performance optimization
         numba_precision : str
             precision of the Numba calculations, either 'float64' or 'float32'.
+        fast_paths : bool
+            fork setting FAST_PATHS: with numba on, use ``np_balancer_numba_fast``,
+            whose result is identical bit for bit (default False: upstream kernel)
         """
 
         assert isinstance(incidence_table, pd.DataFrame)
@@ -137,7 +145,13 @@ class ListBalancer:
             self.controls_importance = self.controls_importance.astype(np.float32)
 
         # Balancer function
-        self.balancer = np_balancer_numba if self.use_numba else np_balancer_py
+        self.fast_paths = bool(fast_paths)
+        if self.fast_paths:
+            log_kernel_choice_once(self.use_numba)
+        if self.use_numba and self.fast_paths:
+            self.balancer = np_balancer_numba_fast
+        else:
+            self.balancer = np_balancer_numba if self.use_numba else np_balancer_py
 
     def balance(self):
         logger.info(
