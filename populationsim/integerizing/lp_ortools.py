@@ -9,6 +9,22 @@ from populationsim.integerizing.constants import (
 )
 
 
+def _checked_draw_keys(draw_keys, expected_shape):
+    """Validate fork draw keys: expected shape, no NaN or infinite value."""
+    keys = np.asarray(draw_keys, dtype=np.float64)
+    if keys.shape != expected_shape:
+        raise ValueError(
+            "draw_keys shape %s does not match the LP variables %s"
+            % (keys.shape, expected_shape)
+        )
+    if not np.isfinite(keys).all():
+        raise ValueError(
+            "draw_keys: %s non-finite keys out of %s"
+            % ((~np.isfinite(keys)).sum(), keys.size)
+        )
+    return keys
+
+
 def np_integerizer_ortools(
     incidence,
     resid_weights,
@@ -19,6 +35,7 @@ def np_integerizer_ortools(
     relax_ge_upper_bound,
     hh_constraint_ge_bound,
     timeout_in_seconds,
+    draw_keys=None,
 ):
     """
     ortools single-integerizer function taking numpy data types and conforming to a
@@ -37,6 +54,13 @@ def np_integerizer_ortools(
     relax_ge_upper_bound : numpy.ndarray(control_count,) float
     hh_constraint_ge_bound : numpy.ndarray(control_count,) float
     timeout_in_seconds : int
+    draw_keys : numpy.ndarray(sample_count,) float or None
+        fork option (INTEGERIZER_DRAW): random order-sampling keys from
+        populationsim.integerizing.draw.draw_keys. When given, the household
+        term of the objective is x * draw_keys instead of
+        x * (log_resid_weights + epsilon * row index); the row-index tie-break
+        is omitted because with random keys it would be a row-position bias.
+        None (default) keeps the upstream objective.
 
     Returns
     -------
@@ -56,6 +80,9 @@ def np_integerizer_ortools(
     }
 
     control_count, sample_count = incidence.shape
+
+    if draw_keys is not None:
+        draw_keys = _checked_draw_keys(draw_keys, (sample_count,))
 
     # - Instantiate a mixed-integer solver
     solver = pywraplp.Solver(
@@ -96,12 +123,17 @@ def np_integerizer_ortools(
     #         objective.SetCoefficient(relax_le[c], control_importance_weights[c])
     #         objective.SetCoefficient(relax_ge[c], control_importance_weights[c])
 
-    epsilon = 1e-6  # Tiny weight tweak to break symmetry in non-unique cases
-    z = (
-        solver.Sum(
+    if draw_keys is None:
+        epsilon = 1e-6  # Tiny weight tweak to break symmetry in non-unique cases
+        household_term = solver.Sum(
             x[hh] * (log_resid_weights[hh] + epsilon * hh)  # forces unique preference
             for hh in range(sample_count)
         )
+    else:
+        # fork: seeded order-sampling keys; no row-index tie-break (see docstring)
+        household_term = solver.Sum(x[hh] * draw_keys[hh] for hh in range(sample_count))
+    z = (
+        household_term
         - solver.Sum(
             relax_le[c] * control_importance_weights[c]
             for c in range(control_count)
@@ -192,6 +224,7 @@ def np_simul_integerizer_ortools(
     total_hh_sub_control_index,
     total_hh_parent_control_index,
     timeout_in_seconds,
+    draw_keys=None,
 ):
     """
     ortools-based siuml-integerizer function taking numpy data types and conforming to a
@@ -218,6 +251,12 @@ def np_simul_integerizer_ortools(
     total_hh_sub_control_index : int
     total_hh_parent_control_index : int
     timeout_in_seconds : int
+    draw_keys : numpy.ndarray(sub_zone_count, sample_count) float or None
+        fork option (INTEGERIZER_DRAW): random order-sampling keys from
+        populationsim.integerizing.draw.draw_keys. When given, they replace
+        the log sub-zone residual weights in the household term, which becomes
+        x[z, hh] * (draw_keys[z, hh] + log_parent_resid_weights[hh]); the
+        parent term is unchanged. None (default) keeps the upstream objective.
 
     Returns
     -------
@@ -242,6 +281,9 @@ def np_simul_integerizer_ortools(
     sample_count, sub_control_count = sub_incidence.shape
     _, parent_control_count = parent_incidence.shape
     sub_zone_count, _ = sub_float_weights.shape
+
+    if draw_keys is not None:
+        draw_keys = _checked_draw_keys(draw_keys, (sub_zone_count, sample_count))
 
     # setting indexes to -1 prevents creation of hh_controls relaxation variables
     # setting hh_control importance to zero eliminates them from the objective function
@@ -303,10 +345,14 @@ def np_simul_integerizer_ortools(
     )
     assert not np.isnan(log_parent_resid_weights).any()
 
+    # fork: with INTEGERIZER_DRAW on, seeded order-sampling keys replace the
+    # log sub-zone residual weights; the parent term below stays as upstream
+    sub_household_coefficients = log_resid_weights if draw_keys is None else draw_keys
+
     # - Set objective function coefficients
     z = (
         solver.Sum(
-            x[z, hh] * log_resid_weights[z, hh]
+            x[z, hh] * sub_household_coefficients[z, hh]
             for z in range(sub_zone_count)
             for hh in range(sample_count)
         )

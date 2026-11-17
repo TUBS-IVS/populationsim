@@ -8,7 +8,7 @@ import pandas as pd
 
 from populationsim.core import config
 from populationsim.integerizing.smart_round import smart_round
-from populationsim.integerizing import bs_options, lp_ortools, lp_cvx
+from populationsim.integerizing import bs_options, draw, lp_ortools, lp_cvx
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +59,15 @@ class SimulIntegerizer:
         self.trace_label = trace_label
 
         # Choose the integerizer function based on configuration
-        if config.setting("USE_CVXPY", False):
+        use_cvxpy = config.setting("USE_CVXPY", False)
+        if use_cvxpy:
             self.integerizer_func = lp_cvx.np_simul_integerizer_cvx
         else:
             self.integerizer_func = lp_ortools.np_simul_integerizer_ortools
 
         self.timeout_in_seconds = bs_options.integerizer_timeout_seconds()
+        # fork: INTEGERIZER_DRAW (off = upstream objective); OR-Tools only
+        self.draw_method = draw.resolve_draw_method(use_cvxpy)
         bs_options.log_options_once()
 
     def integerize(self):
@@ -173,6 +176,16 @@ class SimulIntegerizer:
             print("\n")
             # assert (parent_hh_constraint_ge_bound == parent_max_possible_control_values).all()
 
+        # fork: seeded order-sampling keys replace ln(sub resid) in the LP
+        # objective; with the draw off the call is exactly upstream's
+        draw_kwargs = {}
+        if self.draw_method != "off":
+            draw_kwargs["draw_keys"] = draw.draw_keys(
+                sub_resid_weights,
+                self.draw_method,
+                bs_options.call_rng("simul", self.trace_label),
+            )
+
         resid_weights_out, status_text = self.integerizer_func(
             sub_int_weights,
             parent_countrol_importance,
@@ -192,6 +205,7 @@ class SimulIntegerizer:
             total_hh_sub_control_index,
             total_hh_parent_control_index,
             timeout_in_seconds=self.timeout_in_seconds,
+            **draw_kwargs,
         )
 
         # smart round resid_weights_out for each sub_zone

@@ -9,7 +9,7 @@ import pandas as pd
 from populationsim.core import config
 from populationsim.integerizing.constants import STATUS_OPTIMAL
 from populationsim.integerizing.smart_round import smart_round
-from populationsim.integerizing import bs_options, lp_cvx, lp_ortools
+from populationsim.integerizing import bs_options, draw, lp_cvx, lp_ortools
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +55,15 @@ class Integerizer:
         self.trace_label = trace_label
 
         # Choose the integerizer function based on configuration
-        if config.setting("USE_CVXPY", False):
+        use_cvxpy = config.setting("USE_CVXPY", False)
+        if use_cvxpy:
             self.integerizer_func = lp_cvx.np_integerizer_cvx
         else:
             self.integerizer_func = lp_ortools.np_integerizer_ortools
 
         self.timeout_in_seconds = bs_options.integerizer_timeout_seconds()
+        # fork: INTEGERIZER_DRAW (off = upstream objective); OR-Tools only
+        self.draw_method = draw.resolve_draw_method(use_cvxpy)
         bs_options.log_options_once()
 
     def integerize(self):
@@ -153,6 +156,16 @@ class Integerizer:
                 )
                 # assert False
 
+            # fork: seeded order-sampling keys replace ln(resid) in the LP
+            # objective; with the draw off the call is exactly upstream's
+            draw_kwargs = {}
+            if self.draw_method != "off":
+                draw_kwargs["draw_keys"] = draw.draw_keys(
+                    resid_weights,
+                    self.draw_method,
+                    bs_options.call_rng("single", self.trace_label),
+                )
+
             resid_weights, status = self.integerizer_func(
                 incidence=incidence,
                 resid_weights=resid_weights,
@@ -163,6 +176,7 @@ class Integerizer:
                 relax_ge_upper_bound=relax_ge_upper_bound,
                 hh_constraint_ge_bound=hh_constraint_ge_bound,
                 timeout_in_seconds=self.timeout_in_seconds,
+                **draw_kwargs,
             )
 
             integerized_weights = smart_round(
