@@ -1,6 +1,8 @@
 # PopulationSim
 # See full license in LICENSE.txt.
 
+import time
+
 import numpy as np
 from populationsim.integerizing.constants import (
     STATUS_OPTIMAL,
@@ -36,6 +38,7 @@ def np_integerizer_ortools(
     hh_constraint_ge_bound,
     timeout_in_seconds,
     draw_keys=None,
+    timing=None,
 ):
     """
     ortools single-integerizer function taking numpy data types and conforming to a
@@ -54,6 +57,9 @@ def np_integerizer_ortools(
     relax_ge_upper_bound : numpy.ndarray(control_count,) float
     hh_constraint_ge_bound : numpy.ndarray(control_count,) float
     timeout_in_seconds : int
+    timing : dict or None
+        fork option (INTEGERIZER_PATH_RECORD): when a dict is given it is filled
+        with ``build_s`` (model construction) and ``solve_s`` (solver) seconds.
     draw_keys : numpy.ndarray(sample_count,) float or None
         fork option (INTEGERIZER_DRAW): random order-sampling keys from
         populationsim.integerizing.draw.draw_keys. When given, the household
@@ -83,6 +89,8 @@ def np_integerizer_ortools(
 
     if draw_keys is not None:
         draw_keys = _checked_draw_keys(draw_keys, (sample_count,))
+
+    build_start = time.perf_counter()
 
     # - Instantiate a mixed-integer solver
     solver = pywraplp.Solver(
@@ -191,7 +199,12 @@ def np_integerizer_ortools(
 
     solver.EnableOutput()
 
+    solve_start = time.perf_counter()
     result_status = solver.Solve()
+    solve_end = time.perf_counter()
+    if timing is not None:
+        timing["build_s"] = solve_start - build_start
+        timing["solve_s"] = solve_end - solve_start
 
     status_text = STATUS_TEXT[result_status]
 
@@ -225,6 +238,7 @@ def np_simul_integerizer_ortools(
     total_hh_parent_control_index,
     timeout_in_seconds,
     draw_keys=None,
+    timing=None,
 ):
     """
     ortools-based siuml-integerizer function taking numpy data types and conforming to a
@@ -251,6 +265,9 @@ def np_simul_integerizer_ortools(
     total_hh_sub_control_index : int
     total_hh_parent_control_index : int
     timeout_in_seconds : int
+    timing : dict or None
+        fork option (INTEGERIZER_PATH_RECORD): when a dict is given it is filled
+        with ``build_s`` (model construction) and ``solve_s`` (solver) seconds.
     draw_keys : numpy.ndarray(sub_zone_count, sample_count) float or None
         fork option (INTEGERIZER_DRAW): random order-sampling keys from
         populationsim.integerizing.draw.draw_keys. When given, they replace
@@ -294,6 +311,8 @@ def np_simul_integerizer_ortools(
     # FIXME total_hh_parent_control_index should not exist???
     if total_hh_parent_control_index > 0:
         parent_countrol_importance[total_hh_parent_control_index] = 0
+
+    build_start = time.perf_counter()
 
     # - Instantiate a mixed-integer solver
     solver = pywraplp.Solver(
@@ -442,7 +461,12 @@ def np_simul_integerizer_ortools(
                 )
                 parent_constraint_ge[c].SetCoefficient(parent_relax_ge[c], 1.0)
 
+    solve_start = time.perf_counter()
     result_status = solver.Solve()
+    solve_end = time.perf_counter()
+    if timing is not None:
+        timing["build_s"] = solve_start - build_start
+        timing["solve_s"] = solve_end - solve_start
 
     status_text = STATUS_TEXT[result_status]
 

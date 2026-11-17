@@ -9,7 +9,7 @@ import pandas as pd
 from populationsim.core import config
 from populationsim.integerizing.constants import STATUS_OPTIMAL
 from populationsim.integerizing.smart_round import smart_round
-from populationsim.integerizing import bs_options, draw, lp_cvx, lp_ortools
+from populationsim.integerizing import bs_options, draw, lp_cvx, lp_ortools, path_record
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,8 @@ class Integerizer:
         self.timeout_in_seconds = bs_options.integerizer_timeout_seconds()
         # fork: INTEGERIZER_DRAW (off = upstream objective); OR-Tools only
         self.draw_method = draw.resolve_draw_method(use_cvxpy)
+        self.use_cvxpy = bool(use_cvxpy)
+        path_record.check_usable()
         bs_options.log_options_once()
 
     def integerize(self):
@@ -92,6 +94,8 @@ class Integerizer:
 
         int_weights = float_weights.astype(int)
         resid_weights = float_weights % 1.0
+        # fork: LP timing for the path record (None = upstream call)
+        timing = None
 
         if (resid_weights == 0.0).all():
             # not sure this matters...
@@ -102,6 +106,7 @@ class Integerizer:
 
             integerized_weights = int_weights
             status = STATUS_OPTIMAL
+            timing = {"build_s": 0.0, "solve_s": 0.0}
 
         else:
 
@@ -167,6 +172,9 @@ class Integerizer:
                     bs_options.call_rng("single", self.trace_label),
                 )
                 draw_kwargs["draw_keys"] = draw_keys
+            if bs_options.path_record_enabled() and not self.use_cvxpy:
+                timing = {}
+                draw_kwargs["timing"] = timing
             input_resid_weights = resid_weights
 
             resid_weights, status = self.integerizer_func(
@@ -195,6 +203,14 @@ class Integerizer:
                     self.total_hh_control_value,
                     tie_keys=draw_keys,
                 )
+
+        path_record.record_call(
+            "single",
+            self.trace_label,
+            status,
+            rows=sample_count,
+            timing=timing,
+        )
 
         self.weights = pd.DataFrame(index=self.incidence_table.index)
         self.weights["integerized_weight"] = integerized_weights

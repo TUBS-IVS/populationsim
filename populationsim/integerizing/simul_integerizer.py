@@ -8,7 +8,7 @@ import pandas as pd
 
 from populationsim.core import config
 from populationsim.integerizing.smart_round import smart_round
-from populationsim.integerizing import bs_options, draw, lp_ortools, lp_cvx
+from populationsim.integerizing import bs_options, draw, lp_ortools, lp_cvx, path_record
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,8 @@ class SimulIntegerizer:
         self.timeout_in_seconds = bs_options.integerizer_timeout_seconds()
         # fork: INTEGERIZER_DRAW (off = upstream objective); OR-Tools only
         self.draw_method = draw.resolve_draw_method(use_cvxpy)
+        self.use_cvxpy = bool(use_cvxpy)
+        path_record.check_usable()
         bs_options.log_options_once()
 
     def integerize(self):
@@ -188,6 +190,12 @@ class SimulIntegerizer:
             )
             draw_kwargs["draw_keys"] = draw_keys
 
+        # fork: LP timing for the path record (None = upstream call)
+        timing = None
+        if bs_options.path_record_enabled() and not self.use_cvxpy:
+            timing = {}
+            draw_kwargs["timing"] = timing
+
         resid_weights_out, status_text = self.integerizer_func(
             sub_int_weights,
             parent_countrol_importance,
@@ -208,6 +216,15 @@ class SimulIntegerizer:
             total_hh_parent_control_index,
             timeout_in_seconds=self.timeout_in_seconds,
             **draw_kwargs,
+        )
+
+        path_record.record_call(
+            "simul",
+            self.trace_label,
+            status_text,
+            zones=len(self.sub_weights.columns),
+            rows=len(self.incidence_df.index),
+            timing=timing,
         )
 
         # smart round resid_weights_out for each sub_zone

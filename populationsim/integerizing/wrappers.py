@@ -5,6 +5,7 @@ import pandas as pd
 from populationsim.core import config
 from populationsim.integerizing.single_integerizer import Integerizer
 from populationsim.integerizing.simul_integerizer import SimulIntegerizer
+from populationsim.integerizing import path_record
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +277,9 @@ def do_integerizing(
             "Integerizer failed for %s status %s. "
             "Returning smart-rounded original weights" % (trace_label, status)
         )
+        path_record.record_outcome(
+            "single_failed_smart_round", trace_label=trace_label
+        )
     elif status != "OPTIMAL":
         logger.warning(
             "Integerizer status non-optimal for %s status %s." % (trace_label, status)
@@ -284,6 +288,19 @@ def do_integerizing(
     integerized_weights = pd.Series(0, index=zero_weight_rows.index)
     integerized_weights.update(integerizer.weights["integerized_weight"])
     return integerized_weights, status
+
+
+def _record_parent_outcome(
+    outcome, trace_label, sub_geography, sub_control_zones, rounded_zone_ids
+):
+    """Fork: one path-record row for the parent (no-op unless recording)."""
+    path_record.record_outcome(
+        outcome,
+        geography=sub_geography,
+        trace_label=trace_label,
+        zones=len(sub_control_zones),
+        rounded_zones=len(rounded_zone_ids),
+    )
 
 
 def do_simul_integerizing(
@@ -347,6 +364,9 @@ def do_simul_integerizing(
         logger.info(
             "do_simul_integerizing succeeded for %s status %s. " % (trace_label, status)
         )
+        _record_parent_outcome(
+            "simultaneous", trace_label, sub_geography, sub_control_zones, []
+        )
         return integerized_weights_df
 
     logger.warning(
@@ -382,6 +402,13 @@ def do_simul_integerizing(
             "do_simul_integerizing returning smart rounded weights for %s."
             % trace_label
         )
+        _record_parent_outcome(
+            "smart_round_all_subzones",
+            trace_label,
+            sub_geography,
+            sub_control_zones,
+            rounded_zone_ids,
+        )
         return rounded_weights_df
 
     if len(rounded_zone_ids) == 0:
@@ -395,6 +422,13 @@ def do_simul_integerizing(
             "do_simul_integerizing falling back to sequential integerizing for %s."
             % trace_label
         )
+        _record_parent_outcome(
+            "sequential_no_infeasible_subzones",
+            trace_label,
+            sub_geography,
+            sub_control_zones,
+            rounded_zone_ids,
+        )
         return sequentially_integerized_weights_df
 
     if len(feasible_zone_ids) == 1:
@@ -404,10 +438,18 @@ def do_simul_integerizing(
             "do_simul_integerizing failed but found no infeasible sub zones %s. "
             % trace_label
         )
+        _record_parent_outcome(
+            "sequential_single_feasible_subzone",
+            trace_label,
+            sub_geography,
+            sub_control_zones,
+            rounded_zone_ids,
+        )
         return pd.concat([sequentially_integerized_weights_df, rounded_weights_df])
 
     # - remove the infeasible subzones and retry simul_integerizing
 
+    parent_sub_control_zones = sub_control_zones
     sub_controls_df = sub_controls_df.loc[feasible_zone_ids]
     sub_control_zones = sub_control_zones.loc[
         sub_control_zones.index.isin(feasible_zone_ids)
@@ -437,6 +479,13 @@ def do_simul_integerizing(
             "do_simul_integerizing retry succeeded for %s status %s. "
             % (trace_label, status)
         )
+        _record_parent_outcome(
+            "retry_simultaneous",
+            trace_label,
+            sub_geography,
+            parent_sub_control_zones,
+            rounded_zone_ids,
+        )
         return pd.concat([integerized_weights_df, rounded_weights_df])
 
     # haven't seen this happen, but I suppose it could...
@@ -449,6 +498,13 @@ def do_simul_integerizing(
     )
 
     # nothing to do but return do_sequential_integerizing combined results
+    _record_parent_outcome(
+        "sequential_retry_failed",
+        trace_label,
+        sub_geography,
+        parent_sub_control_zones,
+        rounded_zone_ids,
+    )
     return pd.concat([sequentially_integerized_weights_df, rounded_weights_df])
 
 
