@@ -147,6 +147,7 @@ def do_integerizing(
     incidence_table,
     float_weights,
     total_hh_control_col,
+    record_failure=True,
 ):
     """
 
@@ -163,6 +164,9 @@ def do_integerizing(
         balanced float weights to integerize
     total_hh_control_col : str
         name of total_hh column (preferentially constrain to match this control)
+    record_failure : bool
+        fork: write a single_failed_smart_round path-record row on failure;
+        False when the caller's own outcome row already reports the failure
 
     Returns
     -------
@@ -277,9 +281,10 @@ def do_integerizing(
             "Integerizer failed for %s status %s. "
             "Returning smart-rounded original weights" % (trace_label, status)
         )
-        path_record.record_outcome(
-            "single_failed_smart_round", trace_label=trace_label
-        )
+        if record_failure:
+            path_record.record_outcome(
+                "single_failed_smart_round", trace_label=trace_label
+            )
     elif status != "OPTIMAL":
         logger.warning(
             "Integerizer status non-optimal for %s status %s." % (trace_label, status)
@@ -390,6 +395,7 @@ def do_simul_integerizing(
         sub_control_zones,
         sub_geography,
         combine_results=False,
+        record_failure=False,
     )
 
     if len(feasible_zone_ids) == 0:
@@ -518,6 +524,7 @@ def do_sequential_integerizing(
     sub_control_zones,
     sub_geography,
     combine_results=True,
+    record_failure=True,
 ):
     """
 
@@ -542,6 +549,8 @@ def do_sequential_integerizing(
         for use in sub_controls_df column names
     combine_results : bool
         return all results in a single frame or return infeasible rounded results separately?
+    record_failure : bool
+        fork: passed to do_integerizing (path-record row for a failed zone)
     Returns
     -------
 
@@ -588,6 +597,7 @@ def do_sequential_integerizing(
             incidence_table=incidence_df[control_spec.target],
             float_weights=weights,
             total_hh_control_col=total_hh_control_col,
+            record_failure=record_failure,
         )
 
         zone_weights_df = pd.DataFrame(index=list(range(0, len(integer_weights.index))))

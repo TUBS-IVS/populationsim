@@ -5,6 +5,11 @@
 Every integerizer LP call and every parent outcome of the simultaneous
 integerizer wrapper is appended as one row to ``integerizer_paths.csv`` in the
 output directory. All functions are no-ops while the option is off (default).
+
+The file is only ever appended to, never truncated: the caller must start each
+run with an empty output directory (a resumed run appends duplicate rows).
+The file name never carries the output file prefix. With the OR-Tools solver
+``build_s`` / ``solve_s`` are measured; with CVXPY they stay empty.
 """
 
 from __future__ import annotations
@@ -49,7 +54,8 @@ def check_usable():
 
 def _append(row):
     global _logged
-    path = config.output_file_path(FILE_NAME)
+    # never prefixed: the pipeline reader expects <output>/integerizer_paths.csv
+    path = config.build_output_file_path(FILE_NAME, use_prefix=None)
     if not _logged:
         _logged = True
         logger.info("integerizer path record: appending to %s", path)

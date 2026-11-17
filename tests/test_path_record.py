@@ -52,7 +52,11 @@ def settings(monkeypatch, tmp_path):
         config, "setting", lambda key, default=None: values.get(key, default)
     )
     record = tmp_path / "integerizer_paths.csv"
-    monkeypatch.setattr(config, "output_file_path", lambda name: str(record))
+    monkeypatch.setattr(
+        config,
+        "build_output_file_path",
+        lambda name, use_prefix=None: str(record.with_name(name)),
+    )
     bs_options.reset_for_tests()
     path_record.reset_for_tests()
     values["_record_path"] = record
@@ -455,3 +459,55 @@ def test_record_does_not_change_results(tmp_path):
 
     assert len(base) > 0
     assert canon(base).equals(canon(rec))
+
+
+def test_all_rounded_branch_writes_no_single_failed_rows(settings, monkeypatch):
+    """Five failing zones: one parent outcome row, no per-zone failure rows."""
+    settings["INTEGERIZER_PATH_RECORD"] = True
+    settings["INTEGERIZE_WITH_BACKSTOPPED_CONTROLS"] = False
+
+    class FailingIntegerizer:
+        def __init__(self, **kwargs):
+            self.weights = pd.DataFrame(
+                {"integerized_weight": [1, 1, 1]}, index=kwargs["float_weights"].index
+            )
+
+        def integerize(self):
+            return "INFEASIBLE"
+
+    monkeypatch.setattr(wrappers, "Integerizer", FailingIntegerizer)
+    monkeypatch.setattr(
+        wrappers, "try_simul_integerizing", lambda *a, **k: ("INFEASIBLE", None)
+    )
+    inputs = _wrapper_inputs([1, 2, 3, 4, 5])
+    inputs["control_spec"] = inputs["control_spec"].assign(seed_table="households")
+    wrappers.do_simul_integerizing(**inputs)
+    rows = _rows(settings["_record_path"])
+    assert [r["outcome"] for r in rows] == ["smart_round_all_subzones"]
+    assert rows[0]["rounded_zones"] == "5"
+
+
+def test_record_ignores_output_file_prefix(settings, monkeypatch, tmp_path):
+    """The record name carries no output file prefix."""
+    from populationsim.core import inject
+
+    monkeypatch.undo()  # use the real config helpers, not the fixture's patches
+    out = tmp_path / "pref_out"
+    out.mkdir()
+    inject.add_injectable("output_dir", out)
+    inject.add_injectable("output_file_prefix", "PREFIX")
+    try:
+        monkeypatch.setattr(
+            config,
+            "setting",
+            lambda key, default=None: True
+            if key == "INTEGERIZER_PATH_RECORD"
+            else default,
+        )
+        bs_options.reset_for_tests()
+        path_record.record_outcome("simultaneous", geography="TAZ")
+    finally:
+        inject.add_injectable("output_file_prefix", None)
+        bs_options.reset_for_tests()
+    assert (out / "integerizer_paths.csv").exists()
+    assert not list(out.glob("PREFIX*"))
