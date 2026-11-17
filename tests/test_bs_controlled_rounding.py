@@ -2,14 +2,19 @@
 # See full license in LICENSE.txt.
 """Controlled rounding: targets and costs (pure numpy) and the controlled LP."""
 
+import dataclasses
+
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
+from populationsim.integerizing import controlled_lp
 from populationsim.integerizing import controlled_rounding as cr
 from populationsim.integerizing import lp_ortools
 from populationsim.integerizing.bs_options import PenaltySettings
 from populationsim.integerizing.constants import STATUS_OPTIMAL, STATUS_SUCCESS
 from populationsim.integerizing.smart_round import smart_round
+from tests.bs_controlled_reference import solve_dense_reference
 
 PENALTIES = PenaltySettings(
     floor=100.0, cap=100000.0, parent_total_factor=10.0, conserve_penalty=100000.0
@@ -351,7 +356,11 @@ STAT_KEYS = {
     "slack_parent_sub",
     "slack_parent",
     "slack_conserve",
+    "solver",
 }
+
+# the solver of the behaviour tests; test_all_solvers_agree covers the others
+SOLVER = "highs-ds"
 
 
 def _log_keys(weights):
@@ -368,16 +377,18 @@ def _controlled(weights, incidence, household_controls, **kwargs):
     inputs = _inputs(weights, incidence, household_controls, **kwargs)
     problem = cr.build_problem(**inputs)
     timing = {}
-    resid_out, status, stats = lp_ortools.np_simul_integerizer_controlled_ortools(
+    resid_out, status, stats = controlled_lp.solve_relaxation(
         problem,
         inputs["sub_incidence"],
         inputs["parent_incidence"],
         inputs["sub_float_weights"] % 1.0,
         inputs["total_hh_sub_control_index"],
-        timeout_in_seconds=60,
+        SOLVER,
+        timeout_seconds=60,
         timing=timing,
     )
     assert set(stats) == STAT_KEYS
+    assert stats["solver"] == SOLVER
     return problem, resid_out, status, stats, timing
 
 
@@ -650,12 +661,14 @@ def test_controlled_without_parent_controls():
 
 
 def test_controlled_single_zone_with_integer_weights(monkeypatch):
+    import scipy.optimize
     from ortools.linear_solver import pywraplp
 
     def no_solver(*args, **kwargs):
-        raise AssertionError("the solver must not be built without variables")
+        raise AssertionError("no solver may be called without variables")
 
-    monkeypatch.setattr(pywraplp, "Solver", no_solver)
+    monkeypatch.setattr(scipy.optimize, "linprog", no_solver)
+    monkeypatch.setattr(pywraplp.Solver, "CreateSolver", no_solver)
     weights = [[2.0, 1.0, 3.0]]
     controls = [6]
 
@@ -671,6 +684,390 @@ def test_controlled_single_zone_with_integer_weights(monkeypatch):
         "slack_parent_sub": 0.0,
         "slack_parent": 0.0,
         "slack_conserve": 0.0,
+        "solver": SOLVER,
     }
+    assert timing["solve_s"] == 0.0
     rounded = _rounded(weights, resid_out, controls)
     np.testing.assert_array_equal(rounded, [[2, 1, 3]])
+
+
+# --- the sparse LP against the dense reference, and the solver backends ------
+
+
+def _random_case(seed):
+    """A random small parent: (problem, sub_incidence, parent_incidence,
+    sub_resid_weights, keys, weights). Column 0 is the household total.
+
+    Every row's weights over the zones sum to an integer parent weight (as the
+    balancer leaves them); some rows sit wholly in one zone (no residual,
+    hence no variable); some zones' household controls are off by one."""
+    rng = np.random.default_rng(seed)
+    zones = int(rng.integers(2, 6))
+    rows = int(rng.integers(5, 26))
+    controls = int(rng.integers(3, 7))
+    parent_controls = int(rng.integers(0, 4))
+    parent_weight = rng.integers(1, 5, size=rows).astype(np.float64)
+    weights = rng.dirichlet(np.full(zones, 0.8), size=rows).T * parent_weight
+    whole = rng.random(rows) < 0.2
+    weights[:, whole] = 0.0
+    weights[rng.integers(0, zones, size=whole.sum()), np.flatnonzero(whole)] = (
+        parent_weight[whole]
+    )
+    incidence = rng.integers(0, 4, size=(rows, controls)) * (
+        rng.random((rows, controls)) < 0.5
+    )
+    incidence[:, 0] = 1
+    parent_incidence = rng.integers(0, 4, size=(rows, parent_controls)) * (
+        rng.random((rows, parent_controls)) < 0.5
+    )
+    levels = [0.0, 50.0, 200.0, 1000.0, 5000.0, 20000.0, 1e6]
+    importance = np.concatenate([[1e9], rng.choice(levels, controls - 1)])
+    parent_importance = rng.choice(levels, parent_controls)
+    household_controls = np.rint(weights.sum(axis=1))
+    off = rng.random(zones) < 0.3
+    household_controls[off] += rng.integers(-1, 2, size=off.sum())
+    household_controls = np.maximum(household_controls, 0)
+    keys = rng.uniform(-40.0, 40.0, size=(zones, rows))
+    penalties = PENALTIES
+    if seed % 4 == 3:
+        # conservation free of charge: the dense form drops its rows
+        penalties = PENALTIES._replace(conserve_penalty=0.0)
+    inputs = _inputs(
+        weights,
+        incidence,
+        household_controls,
+        importance=importance,
+        parent_incidence=parent_incidence,
+        parent_importance=parent_importance,
+        keys=keys,
+    )
+    inputs["penalties"] = penalties
+    problem = cr.build_problem(**inputs)
+    return (
+        problem,
+        inputs["sub_incidence"],
+        inputs["parent_incidence"],
+        weights % 1.0,
+        keys,
+        weights,
+    )
+
+
+def _sparse_and_dense(case, solver=SOLVER):
+    problem, inc, pinc, resid, _, _ = case
+    lp = controlled_lp.assemble(problem, inc, pinc, 0)
+    sparse = controlled_lp.solve_lp(lp, solver, 60)
+    dense = solve_dense_reference(problem, inc, pinc, resid, 0, 60)
+    return lp, sparse, dense
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_sparse_lp_matches_the_dense_reference(seed):
+    case = _random_case(seed)
+    problem, inc, pinc, resid, _, _ = case
+    lp, sparse, (dense_x, dense_status, dense_objective) = _sparse_and_dense(case)
+    assert sparse.status_text in STATUS_SUCCESS
+    assert dense_status in STATUS_SUCCESS
+    assert sparse.objective == pytest.approx(dense_objective, rel=1e-6, abs=1e-6)
+    # the sparse solution meets the hard zone counts
+    x = np.zeros(problem.x_allowed.shape)
+    x[problem.x_allowed] = sparse.values[lp.blocks["x"]]
+    np.testing.assert_allclose(x.sum(axis=1), problem.hh_count, atol=1e-6)
+    # and solve_relaxation reports the same success
+    _, status, stats = controlled_lp.solve_relaxation(
+        problem, inc, pinc, resid, 0, SOLVER, 60
+    )
+    assert status in STATUS_SUCCESS
+    assert stats["x_count"] == int(problem.x_allowed.sum())
+
+
+def _snapped(values):
+    nearest = np.round(values)
+    return np.where(np.abs(values - nearest) <= 1e-6, nearest, values)
+
+
+def _cost_of(x, problem, weights, inc, pinc, keys, conserve_penalty, total_index=0):
+    """Objective of the controlled LP at an integral x, computed from the
+    definitions, not from the LP arrays.
+
+    Cell (z, c != t): the LP's cell term is minus
+    ``cell_cost(y) - q f + q (1 - 2f) band_lo``: the ranged-row cost equals
+    ``cell_cost(y) - q f`` (``controlled_rounding`` docstring), and the
+    fold into ``x_coef`` measures ``y`` from the integer part ``A`` instead
+    of from ``lo = floor(F')``, a constant ``q (1 - 2f) (lo - A)`` per cell.
+    """
+    a = np.floor(weights)
+    y = (a + x) @ inc
+    float_totals = weights @ inc
+    snapped = _snapped(float_totals)
+    lo = np.floor(snapped)
+    f = snapped - lo
+    band_lo = lo - a @ inc
+    q = problem.cell_penalty
+    cell = 0.0
+    for z in range(weights.shape[0]):
+        for c in range(inc.shape[1]):
+            if c == total_index:
+                continue
+            cell += cr.cell_cost(y[z, c], float_totals[z, c], q[c])
+            cell += -q[c] * f[z, c] + q[c] * (1 - 2 * f[z, c]) * band_lo[z, c]
+    conserve = (
+        conserve_penalty
+        * np.abs(x.sum(axis=0) - np.round((weights % 1.0).sum(axis=0))).sum()
+    )
+    sub_dev = np.abs(y.sum(axis=0) - np.round(float_totals.sum(axis=0)))
+    sub_dev[total_index] = 0.0
+    parent_sub = (problem.parent_sub_penalty * sub_dev).sum()
+    parent_dev = np.abs(
+        (a + x).sum(axis=0) @ pinc - np.round(weights.sum(axis=0) @ pinc)
+    )
+    parent = (problem.parent_penalty * parent_dev).sum()
+    key_term = (x * np.clip(keys, -cr.KEY_CLIP, cr.KEY_CLIP)).sum()
+    return key_term - cell - conserve - parent_sub - parent
+
+
+# seeds of _random_case whose LP optimum is integral under every solver of
+# SOLVERS (checked in the test), with slack in cells and conservation
+INTEGRAL_SEEDS = (34, 36, 53)
+
+
+@pytest.mark.parametrize("seed", INTEGRAL_SEEDS)
+def test_reported_objective_equals_the_cost_of_the_solution(seed):
+    case = _random_case(seed)
+    problem, inc, pinc, resid, keys, weights = case
+    lp = controlled_lp.assemble(problem, inc, pinc, 0)
+    result = controlled_lp.solve_lp(lp, SOLVER, 60)
+    assert result.status_text in STATUS_SUCCESS
+    assert result.objective == pytest.approx(lp.objective @ result.values, rel=1e-9)
+    x = np.zeros(problem.x_allowed.shape)
+    x[problem.x_allowed] = result.values[lp.blocks["x"]]
+    assert np.abs(x - np.round(x)).max() < 1e-6, "pick a seed with integral x"
+    x = np.round(x)
+    expected = _cost_of(x, problem, weights, inc, pinc, keys, problem.conserve_penalty)
+    assert result.objective == pytest.approx(expected, rel=1e-9, abs=1e-6)
+
+
+def _infeasible_lp():
+    """x0 + x1 = 3 with x in [0, 1]."""
+    empty = slice(2, 2)
+    blocks = {name: empty for name in controlled_lp.VARIABLE_BLOCKS}
+    blocks["x"] = slice(0, 2)
+    no_index = np.zeros(0, dtype=np.int64)
+    return controlled_lp.LinearProgram(
+        objective=np.array([1.0, 1.0]),
+        matrix=sp.csr_matrix(np.array([[1.0, 1.0]])),
+        rhs=np.array([3.0]),
+        lower=np.zeros(2),
+        upper=np.ones(2),
+        x_index=np.array([[0, 1]], dtype=np.int64),
+        blocks=blocks,
+        row_blocks={
+            name: slice(0, 1) if name == "zone_count" else slice(1, 1)
+            for name in controlled_lp.ROW_BLOCKS
+        },
+        cell_zone=no_index,
+        cell_control=no_index,
+        count_zone=np.array([0], dtype=np.int64),
+        conserve_row=no_index,
+        parent_sub_control=no_index,
+        parent_control=no_index,
+    )
+
+
+def _agreement_cases():
+    weights = np.array([[0.1] * 10, [1.4, 1.2] * 5, [1.5, 1.7] * 5]).T
+    rare = (
+        cr.build_problem(
+            **_inputs(
+                weights,
+                [[1, 1, 0], [1, 0, 1], [1, 0, 0]],
+                [3] * 10,
+                importance=[1e9, 1000.0, 1000.0],
+                keys=_log_keys(weights),
+            )
+        ),
+        np.array([[1, 1, 0], [1, 0, 1], [1, 0, 0]], dtype=np.float64),
+        np.zeros((3, 0)),
+        weights % 1.0,
+    )
+    weights, _, _, (problem, _, _, _, _) = _conservation_case()
+    incidence = np.array(
+        [[1, 1, 0, 1], [1, 0, 1, 2], [1, 1, 1, 3], [1, 0, 0, 2], [1, 0, 1, 4]],
+        dtype=np.float64,
+    )
+    parent_incidence = np.array([[0], [1], [1], [0], [1]], dtype=np.float64)
+    conservation = (problem, incidence, parent_incidence, weights % 1.0)
+    random_problem, inc, pinc, resid, _, _ = _random_case(7)
+    return [rare, conservation, (random_problem, inc, pinc, resid)]
+
+
+@pytest.mark.parametrize("solver", controlled_lp.SOLVERS)
+def test_all_solvers_agree(solver):
+    for problem, inc, pinc, resid in _agreement_cases():
+        lp = controlled_lp.assemble(problem, inc, pinc, 0)
+        result = controlled_lp.solve_lp(lp, solver, 60)
+        _, dense_status, dense_objective = solve_dense_reference(
+            problem, inc, pinc, resid, 0, 60
+        )
+        assert dense_status in STATUS_SUCCESS
+        assert result.status_text in STATUS_SUCCESS
+        assert result.objective == pytest.approx(dense_objective, rel=1e-6)
+        assert result.values.shape == lp.objective.shape
+        assert result.solve_seconds >= 0.0
+
+    infeasible = controlled_lp.solve_lp(_infeasible_lp(), solver, 60)
+    assert infeasible.status_text == "INFEASIBLE"
+    assert infeasible.values is None
+    assert np.isnan(infeasible.objective)
+
+
+@pytest.mark.parametrize(
+    "solver", [name for name in controlled_lp.SOLVERS if not name.startswith("highs")]
+)
+def test_a_stop_before_the_optimum_is_not_solved(solver, monkeypatch):
+    # An OR-Tools LP backend reports FEASIBLE only when it stops at a limit
+    # with a feasible, non-optimal point (clp-primal and glop-primal do so at
+    # the time limit on a 40 x 3000 parent): that point must not pass as a
+    # success.
+    from ortools.linear_solver import pywraplp
+
+    monkeypatch.setattr(
+        pywraplp.Solver, "Solve", lambda self, *args: pywraplp.Solver.FEASIBLE
+    )
+    problem, inc, pinc, resid, _, _ = _random_case(0)
+    lp = controlled_lp.assemble(problem, inc, pinc, 0)
+    result = controlled_lp.solve_lp(lp, solver, 60)
+    assert result.status_text == "NOT_SOLVED"
+    assert result.values is None
+    resid_out, status, stats = controlled_lp.solve_relaxation(
+        problem, inc, pinc, resid, 0, solver, 60
+    )
+    assert status == "NOT_SOLVED"
+    assert resid_out is resid
+    assert stats["slack_conserve"] == 0.0
+
+
+def test_unknown_solver_is_refused():
+    problem, inc, pinc, resid, _, _ = _random_case(0)
+    lp = controlled_lp.assemble(problem, inc, pinc, 0)
+    with pytest.raises(ValueError, match="INTEGERIZER_CONTROLLED_SOLVER"):
+        controlled_lp.solve_lp(lp, "gurobi", 60)
+    with pytest.raises(ValueError, match="INTEGERIZER_CONTROLLED_SOLVER"):
+        controlled_lp.solve_relaxation(problem, inc, pinc, resid, 0, "highs", 60)
+
+
+def test_assemble_shapes_and_blocks():
+    # two zones, three rows; columns household total, c1, c2, c3; one parent
+    # control. Variables x0 = (0, 0), x1 = (0, 1), x2 = (1, 0), x3 = (1, 2).
+    # Cell (1, c2) has no variable of non-zero incidence and the band [0, 0]:
+    # left out. c3 has no incidence and target 0: no cell, no parent row.
+    zeros = np.zeros((2, 4))
+    problem = cr.ControlledProblem(
+        x_allowed=np.array([[True, True, False], [True, False, True]]),
+        hh_count=np.array([1, 1]),
+        band_lo=np.array([[0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]]),
+        band_hi=np.array([[1.0, 1.0, 2.0, 0.0], [1.0, 1.0, 0.0, 0.0]]),
+        frac=zeros,
+        under_price=np.array([[0.0, 150.0, 200.0, 0.0], [0.0, 300.0, 0.0, 0.0]]),
+        over_price=np.array([[0.0, 50.0, 210.0, 0.0], [0.0, 7.0, 0.0, 0.0]]),
+        cell_penalty=np.array([1e5, 100.0, 200.0, 300.0]),
+        parent_sub_target=np.array([0.0, 1.0, 1.0, 0.0]),
+        parent_sub_penalty=np.array([1e5, 1000.0, 2000.0, 3000.0]),
+        parent_target=np.array([1.0]),
+        parent_penalty=np.array([800.0]),
+        conserve_target=np.array([1.0, 0.0, 1.0]),
+        conserve_penalty=1e5,
+        x_coef=np.array([[1.5, -2.0, 9.0], [3.0, 9.0, -4.0]]),
+        hh_unreachable=0,
+        hh_outside_lp=0,
+        hh_excess=0,
+    )
+    inc = np.array([[1, 1, 0, 0], [1, 0, 2, 0], [1, 1, 0, 0]], dtype=np.float64)
+    pinc = np.array([[0], [1], [1]], dtype=np.float64)
+
+    lp = controlled_lp.assemble(problem, inc, pinc, 0)
+
+    sizes = {
+        "x": 4,
+        "cell_band": 3,
+        "cell_under": 3,
+        "cell_over": 3,
+        "conserve_under": 3,
+        "conserve_over": 3,
+        "parent_sub_under": 2,
+        "parent_sub_over": 2,
+        "parent_under": 1,
+        "parent_over": 1,
+    }
+    assert list(lp.blocks) == list(controlled_lp.VARIABLE_BLOCKS)
+    start = 0
+    for name, size in sizes.items():
+        assert lp.blocks[name] == slice(start, start + size), name
+        start += size
+    row_sizes = {"cell": 3, "zone_count": 2, "conserve": 3, "parent_sub": 2}
+    row_sizes["parent"] = 1
+    assert list(lp.row_blocks) == list(controlled_lp.ROW_BLOCKS)
+    start = 0
+    for name, size in row_sizes.items():
+        assert lp.row_blocks[name] == slice(start, start + size), name
+        start += size
+    np.testing.assert_array_equal(lp.x_index, [[0, 1, -1], [2, -1, 3]])
+    np.testing.assert_array_equal(lp.cell_zone, [0, 0, 1])
+    np.testing.assert_array_equal(lp.cell_control, [1, 2, 1])
+    np.testing.assert_array_equal(lp.count_zone, [0, 1])
+    np.testing.assert_array_equal(lp.conserve_row, [0, 1, 2])
+    np.testing.assert_array_equal(lp.parent_sub_control, [1, 2])
+    np.testing.assert_array_equal(lp.parent_control, [0])
+
+    # columns: x 0-3, band 4-6, cell under 7-9, cell over 10-12, conserve
+    # under 13-15, conserve over 16-18, parent-sub under 19-20, over 21-22,
+    # parent under 23, over 24
+    expected = np.zeros((11, 25))
+    # cell (0, c1): x0 (row 0, inc 1); cell (0, c2): x1 (row 1, inc 2);
+    # cell (1, c1): x2 (row 0, inc 1), x3 (row 2, inc 1)
+    expected[0, [0, 4, 7, 10]] = [1, -1, 1, -1]
+    expected[1, [1, 5, 8, 11]] = [2, -1, 1, -1]
+    expected[2, [2, 3, 6, 9, 12]] = [1, 1, -1, 1, -1]
+    # zone counts
+    expected[3, [0, 1]] = 1
+    expected[4, [2, 3]] = 1
+    # conservation of rows 0, 1, 2
+    expected[5, [0, 2, 13, 16]] = [1, 1, 1, -1]
+    expected[6, [1, 14, 17]] = [1, 1, -1]
+    expected[7, [3, 15, 18]] = [1, 1, -1]
+    # parent-sub c1 on rows 0 and 2: inc * (over - under)
+    expected[8, [13, 15, 16, 18, 19, 21]] = [-1, -1, 1, 1, 1, -1]
+    # parent-sub c2 on row 1 (inc 2)
+    expected[9, [14, 17, 20, 22]] = [-2, 2, 1, -1]
+    # parent control on rows 1 and 2
+    expected[10, [14, 15, 17, 18, 23, 24]] = [-1, -1, 1, 1, 1, -1]
+    assert sp.isspmatrix_csr(lp.matrix)
+    np.testing.assert_array_equal(lp.matrix.toarray(), expected)
+
+    # rhs: cells 0; counts; K; c1: 1 - (1 + 1); c2: 1 - 2 * 0; p: 1 - 1
+    np.testing.assert_array_equal(lp.rhs, [0, 0, 0, 1, 1, 1, 0, 1, -1, 1, 0])
+    big = 1e5
+    np.testing.assert_array_equal(
+        lp.objective,
+        [1.5, -2.0, 3.0, -4.0]
+        + [0.0] * 3
+        + [-150.0, -200.0, -300.0]
+        + [-50.0, -210.0, -7.0]
+        + [-big] * 6
+        + [-1000.0, -2000.0, -1000.0, -2000.0]
+        + [-800.0, -800.0],
+    )
+    inf = np.inf
+    np.testing.assert_array_equal(lp.lower, [0.0] * 4 + [0.0, 1.0, 1.0] + [0.0] * 18)
+    np.testing.assert_array_equal(lp.upper, [1.0] * 4 + [1.0, 2.0, 1.0] + [inf] * 18)
+
+
+def test_assemble_refuses_a_conservation_target_without_variables():
+    problem, inc, pinc, _, _, _ = _random_case(0)
+    no_x = np.flatnonzero(~problem.x_allowed.any(axis=0))
+    assert no_x.size, "pick a seed with a row without variables"
+    target = problem.conserve_target.copy()
+    target[no_x[0]] = 1.0
+    broken = dataclasses.replace(problem, conserve_target=target)
+    with pytest.raises(ValueError, match="conserve_target"):
+        controlled_lp.assemble(broken, inc, pinc, 0)

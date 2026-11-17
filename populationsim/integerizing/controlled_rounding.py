@@ -43,7 +43,7 @@ that a penalty floor above that range always outranks them.
 
 This module computes the targets, bands and prices of that LP without a
 solver (:func:`build_problem`); the LP itself is built from
-:class:`ControlledProblem` in ``lp_ortools``.
+:class:`ControlledProblem` and solved in ``controlled_lp``.
 
 The cell distance as a linear cost
 ----------------------------------
