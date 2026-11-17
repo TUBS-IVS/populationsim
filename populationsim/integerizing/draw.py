@@ -19,6 +19,29 @@ Two key types (setting ``INTEGERIZER_DRAW``):
     "Gumbel top-k"): inclusion is below ``r`` for large ``r`` and above it for
     small ``r``.
 
+These inclusion statements hold for the single integerizer, where the LP
+takes the k largest keys (exactly so with only the household-total control;
+binding controls reshape the choice). The simultaneous integerizer keeps
+upstream's parent term: the coefficient of household ``hh`` in sub-zone ``z``
+is ``key[z, hh] + ln(sum over sub-zones of the residuals of hh)``, so every
+row is tilted by the log of its residual summed over the sub-zones, and the
+inclusion statements above do not carry over unchanged.
+
+Rounding after the LP (``smart_round`` with ``tie_keys``): rows are ordered by
+the LP value first and by the same keys second, so the rows added to reach
+the household target, beyond those the LP rounded up, follow the keys rather
+than the row position. If the LP fails (status not OPTIMAL or FEASIBLE) it
+returns the input residuals; with the draw on, the integerizers then round
+with the value ``r > 0`` and the keys, i.e. they round up the largest keys
+among the households with a positive residual, not the largest residuals.
+``integerizing/wrappers.py`` has no rounding step of its own: its
+"smart-rounded original weights" (failed single integerizer) and the
+"rounded" sub-zones handed on by sequential integerizing are this failure
+branch of ``Integerizer.integerize`` and therefore use the keys. A failed
+``SimulIntegerizer`` result is discarded by ``do_simul_integerizing`` (which
+then falls back to sequential integerizing); its keyed rounding has no effect
+on the output.
+
 The noise comes from the call generator of
 :func:`populationsim.integerizing.bs_options.call_rng`.
 """
@@ -28,6 +51,7 @@ from __future__ import annotations
 import numpy as np
 
 from populationsim.integerizing import bs_options
+from populationsim.integerizing.constants import STATUS_SUCCESS
 
 DRAW_KEY_METHODS = ("pareto", "gumbel")
 
@@ -72,6 +96,18 @@ def draw_keys(
     if method == "gumbel":
         return np.log(r) + rng.gumbel(size=r.shape)
     return np.log(r) - np.log1p(-r) + rng.logistic(size=r.shape)
+
+
+def rounding_values(lp_resid_weights, input_resid_weights, status):
+    """Primary sort values for ``smart_round`` when the draw is on.
+
+    LP success: the LP solution itself. LP failure (the LP then returns the
+    input residuals): ``1.0`` where the input residual is positive, else
+    ``0.0``, so that the keys (``tie_keys``) decide among those households.
+    """
+    if status in STATUS_SUCCESS:
+        return lp_resid_weights
+    return (np.asarray(input_resid_weights) > 0).astype(np.float64)
 
 
 def resolve_draw_method(use_cvxpy) -> str:

@@ -18,8 +18,15 @@ import pandas as pd
 import pytest
 
 from populationsim.core import config
-from populationsim.integerizing import bs_options, lp_ortools
+from populationsim.integerizing import (
+    bs_options,
+    draw,
+    lp_ortools,
+    simul_integerizer,
+    single_integerizer,
+)
 from populationsim.integerizing.draw import draw_keys
+from populationsim.integerizing.smart_round import smart_round
 from populationsim.integerizing.simul_integerizer import SimulIntegerizer
 from populationsim.integerizing.single_integerizer import Integerizer
 from tests.bs_differential import REPO_ROOT, run_example
@@ -48,10 +55,18 @@ def _top_k(values, k):
 # ---------------------------------------------------------------- builders
 
 
-def _single(float_weights, totals, extra_cols=None, importance=1000.0, label="lbl"):
+def _single(
+    float_weights,
+    totals,
+    extra_cols=None,
+    importance=1000.0,
+    label="lbl",
+    target=None,
+):
     """Integerizer with the household-total control (index 0) plus ``extra_cols``.
 
-    ``totals`` are the relaxed control totals, total households first.
+    ``totals`` are the relaxed control totals, total households first (the LP
+    total); ``target`` is the smart_round target (default: the LP total).
     """
     float_weights = np.asarray(float_weights, dtype=np.float64)
     n = len(float_weights)
@@ -66,7 +81,7 @@ def _single(float_weights, totals, extra_cols=None, importance=1000.0, label="lb
         relaxed_control_totals=pd.Series(
             np.asarray(totals, dtype=np.float64), index=names
         ),
-        total_hh_control_value=int(totals[0]),
+        total_hh_control_value=int(totals[0] if target is None else target),
         total_hh_control_index=0,
         control_is_hh_based=pd.Series([True] * len(names), index=names),
         trace_label=label,
@@ -85,18 +100,27 @@ def _simul_total_only(rng, zones, n, label="lbl"):
     float_weights = rng.randint(0, 3, size=(zones, n)) + rng.uniform(
         0.02, 0.98, size=(zones, n)
     )
+    return float_weights, _simul(float_weights, label=label)
+
+
+def _simul(float_weights, label="lbl", extra=0):
+    """SimulIntegerizer for ``float_weights`` (zones x rows), total control only.
+
+    The LP total per zone is round(sum of float weights); the smart_round
+    target (the sub-zone control) is that plus ``extra``.
+    """
+    zones, n = float_weights.shape
     zone_ids = list(range(1, zones + 1))
-    totals = np.round(float_weights.sum(axis=1)).astype(np.int64)
+    totals = np.round(float_weights.sum(axis=1)).astype(np.int64) + extra
     incidence = pd.DataFrame(
         {"num_hh": np.ones(n, dtype=np.int64)}, index=pd.RangeIndex(n, name="hh_id")
     )
     sub_weights = pd.DataFrame(float_weights.T, index=incidence.index, columns=zone_ids)
     sub_controls = pd.DataFrame({"num_hh": totals}, index=zone_ids)
     control_spec = pd.DataFrame({"target": ["num_hh"], "importance": [1000.0]})
-    integerizer = SimulIntegerizer(
+    return SimulIntegerizer(
         incidence, sub_weights, sub_controls, control_spec, "num_hh", label
     )
-    return float_weights, integerizer
 
 
 def _capture_single_lp_inputs(integerizer):
@@ -399,6 +423,212 @@ def test_draw_respects_controls(settings, method):
     # Positive controls: the control binds, and the draw varies with the seed.
     assert unconstrained_differs >= 40, unconstrained_differs
     assert len(selections) >= 2
+
+
+def test_zero_residual_row_with_top_key_stays_unselected(settings, monkeypatch):
+    """Pinning risk: a residual-0 row holding the largest key is never chosen.
+
+    draw_keys gives such a row about -725, but the LP must not depend on that:
+    x_max = 0 fixes it. A row with residual 1e-300 stays selectable.
+    """
+    n, k = 30, 6
+    rng = np.random.RandomState(41)
+    weights = rng.randint(1, 4, size=n) + rng.uniform(0.02, 0.98, size=n)
+    weights[0] = 2.0  # residual 0
+    weights[1] = 1e-300  # residual 1e-300, integer part 0
+    resid = weights % 1.0
+    assert resid[0] == 0.0 and resid[1] == 1e-300
+    assert np.isfinite(draw_keys(resid, "pareto", np.random.RandomState(1))).all()
+    base = int(np.floor(weights).sum())
+    keys = rng.normal(size=n)
+    keys[0], keys[1] = 50.0, 49.0
+    positive = np.flatnonzero(resid > 0)
+    expected = set(positive[np.argsort(keys[positive])[-k:]].tolist())
+    assert 1 in expected
+
+    lp = _capture_single_lp_inputs(_single(weights, [base + k], label="pin"))
+    out, status = lp_ortools.np_integerizer_ortools(**lp, draw_keys=keys)
+    assert status == "OPTIMAL"
+    assert out[0] == 0.0
+    assert np.isclose(out.sum(), k)
+    assert set(np.flatnonzero(out > 0.5).tolist()) == expected
+
+    # End to end through the class (LP + smart_round with tie_keys).
+    settings["INTEGERIZER_DRAW"] = "pareto"
+    monkeypatch.setattr(draw, "draw_keys", lambda *args: keys.copy())
+    integerizer = _single(weights, [base + k], label="pin")
+    integerizer.integerize()
+    got = integerizer.weights["integerized_weight"].to_numpy()
+    assert got[0] == 2
+    assert set(np.flatnonzero(got - np.floor(weights).astype(int)).tolist()) == expected
+
+    # Simultaneous LP: the residual-0 row of zone 0 stays at 0.
+    sim_weights = rng.randint(0, 3, size=(2, n)) + rng.uniform(0.02, 0.98, size=(2, n))
+    sim_weights[0, 0] = 2.0
+    sim_weights[0, 1] = 1e-300
+    settings["INTEGERIZER_DRAW"] = "off"
+    cap = _capture_simul_lp_inputs(_simul(sim_weights, label="pin_simul"))
+    sim_keys = rng.normal(size=(2, n))
+    sim_keys[0, 0], sim_keys[0, 1] = 50.0, 49.0
+    out, status = lp_ortools.np_simul_integerizer_ortools(
+        *cap["args"], **cap["kwargs"], draw_keys=sim_keys
+    )
+    assert status == "OPTIMAL"
+    assert out[0, 0] == 0.0
+    for z in range(2):
+        k_z = int(cap["args"][10][z])
+        assert np.isclose(out[z].sum(), k_z)
+        assert (out[z] > 0.5).sum() == k_z
+
+
+# ---------------------------------------------------------------- rounding
+
+
+def test_smart_round_tie_keys():
+    int_weights = np.array([1, 0, 2, 0, 0, 3])
+    lp_values = np.array([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+    keys = np.array([0.1, 5.0, -1.0, 0.2, 3.0, 4.0])
+    target = int(int_weights.sum()) + 4  # the two LP rows plus two extra rows
+
+    # tie_keys None: exactly the upstream order.
+    upstream = int_weights.copy()
+    upstream[np.argsort(lp_values)[-4:]] += 1
+    np.testing.assert_array_equal(smart_round(int_weights, lp_values, target), upstream)
+    # tie_keys given: LP rows first (despite their small keys), then the two
+    # largest keys among the ties at 0 (rows 1 and 5).
+    expected = int_weights.copy()
+    expected[[0, 3, 1, 5]] += 1
+    np.testing.assert_array_equal(
+        smart_round(int_weights, lp_values, target, tie_keys=keys), expected
+    )
+    with pytest.raises(ValueError):
+        smart_round(int_weights, lp_values, target, tie_keys=keys[:-1])
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_rounding_extra_rows_follow_keys_single(settings, method):
+    """LP total below the rounding target: the extra rows follow the keys."""
+    settings["INTEGERIZER_DRAW"] = method
+    settings["INTEGERIZER_RANDOM_SEED"] = 21
+    n, k, extra = 40, 8, 5
+    rng = np.random.RandomState(31)
+    weights = rng.randint(1, 4, size=n) + rng.uniform(0.02, 0.98, size=n)
+    base = int(np.floor(weights).sum())
+    integerizer = _single(weights, [base + k], label="extra", target=base + k + extra)
+    integerizer.integerize()
+    got = integerizer.weights["integerized_weight"].to_numpy()
+    rounded_up = got - np.floor(weights).astype(int)
+    keys = draw_keys(weights % 1.0, method, bs_options.call_rng("single", "extra"))
+    assert rounded_up.sum() == k + extra
+    assert set(np.flatnonzero(rounded_up).tolist()) == _top_k(keys, k + extra)
+    # Positive control: upstream's argsort of the 0/1 LP solution picks
+    # other extra rows (row order among the ties).
+    lp_solution = np.zeros(n)
+    lp_solution[sorted(_top_k(keys, k))] = 1.0
+    upstream = set(np.argsort(lp_solution)[-(k + extra) :].tolist())
+    assert upstream != _top_k(keys, k + extra)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_rounding_extra_rows_follow_keys_simul(settings, method):
+    settings["INTEGERIZER_DRAW"] = method
+    settings["INTEGERIZER_RANDOM_SEED"] = 21
+    n, extra = 40, 4
+    rng = np.random.RandomState(32)
+    weights = rng.randint(0, 3, size=(2, n)) + rng.uniform(0.02, 0.98, size=(2, n))
+    integerizer = _simul(weights, label="extra_simul", extra=extra)
+    integerizer.integerize()
+    resid = weights % 1.0
+    keys = draw_keys(resid, method, bs_options.call_rng("simul", "extra_simul"))
+    rounded_up = integerizer.integerized_weights.to_numpy().T - np.floor(
+        weights
+    ).astype(int)
+    for z in range(2):
+        k = int(round(weights[z].sum())) - int(np.floor(weights[z]).sum())
+        lp_rows = _top_k(keys[z] + _log_parent(resid), k)
+        rest = np.array(sorted(set(range(n)) - lp_rows))
+        expected = lp_rows | set(rest[np.argsort(keys[z][rest])[-extra:]].tolist())
+        assert rounded_up[z].sum() == k + extra, z
+        assert set(np.flatnonzero(rounded_up[z]).tolist()) == expected, z
+        lp_solution = np.zeros(n)
+        lp_solution[sorted(lp_rows)] = 1.0
+        assert set(np.argsort(lp_solution)[-(k + extra) :].tolist()) != expected
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_failed_lp_rounds_top_keys_single(settings, method):
+    """LP failure: round up the top keys among positive residuals."""
+    settings["INTEGERIZER_DRAW"] = method
+    settings["INTEGERIZER_RANDOM_SEED"] = 22
+    n, k = 40, 10
+    rng = np.random.RandomState(33)
+    weights = rng.randint(1, 4, size=n) + rng.uniform(0.02, 0.98, size=n)
+    weights[:6] = np.floor(weights[:6])  # residual 0
+    base = int(np.floor(weights).sum())
+    integerizer = _single(weights, [base + k], label="failed")
+    integerizer.integerizer_func = lambda **kw: (kw["resid_weights"], "INFEASIBLE")
+    assert integerizer.integerize() == "INFEASIBLE"
+    resid = weights % 1.0
+    keys = draw_keys(resid, method, bs_options.call_rng("single", "failed"))
+    positive = np.flatnonzero(resid > 0)
+    expected = set(positive[np.argsort(keys[positive])[-k:]].tolist())
+    rounded_up = integerizer.weights["integerized_weight"].to_numpy() - np.floor(
+        weights
+    ).astype(int)
+    assert rounded_up.sum() == k
+    assert set(np.flatnonzero(rounded_up).tolist()) == expected
+    # Positive control: upstream would round up the largest residuals.
+    assert _top_k(resid, k) != expected
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_failed_lp_rounds_top_keys_simul(settings, method):
+    settings["INTEGERIZER_DRAW"] = method
+    settings["INTEGERIZER_RANDOM_SEED"] = 22
+    n = 40
+    rng = np.random.RandomState(34)
+    weights = rng.randint(1, 3, size=(2, n)) + rng.uniform(0.02, 0.98, size=(2, n))
+    weights[0, :5] = np.floor(weights[0, :5])  # residual 0
+    integerizer = _simul(weights, label="failed_simul")
+    integerizer.integerizer_func = lambda *a, **kw: (a[5], "INFEASIBLE")
+    assert integerizer.integerize() == "INFEASIBLE"
+    resid = weights % 1.0
+    keys = draw_keys(resid, method, bs_options.call_rng("simul", "failed_simul"))
+    rounded_up = integerizer.integerized_weights.to_numpy().T - np.floor(
+        weights
+    ).astype(int)
+    for z in range(2):
+        k = int(round(weights[z].sum())) - int(np.floor(weights[z]).sum())
+        positive = np.flatnonzero(resid[z] > 0)
+        expected = set(positive[np.argsort(keys[z][positive])[-k:]].tolist())
+        assert rounded_up[z].sum() == k, z
+        assert set(np.flatnonzero(rounded_up[z]).tolist()) == expected, z
+        assert _top_k(resid[z], k) != expected, z
+
+
+def test_smart_round_tie_keys_only_with_draw(settings, monkeypatch):
+    """Draw off: smart_round gets exactly upstream's three arguments."""
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append((len(args), sorted(kwargs)))
+        return smart_round(*args, **kwargs)
+
+    monkeypatch.setattr(single_integerizer, "smart_round", spy)
+    monkeypatch.setattr(simul_integerizer, "smart_round", spy)
+
+    def run_both():
+        _, single = _single_total_only(np.random.RandomState(5), 10, 3)
+        single.integerize()
+        _, simul = _simul_total_only(np.random.RandomState(5), 2, 10)
+        simul.integerize()
+
+    run_both()
+    assert calls == [(3, [])] * 3  # one single call, two sub-zones
+    calls.clear()
+    settings["INTEGERIZER_DRAW"] = "pareto"
+    run_both()
+    assert calls == [(3, ["tie_keys"])] * 3
 
 
 def test_draw_reproducible_and_label_specific(settings):

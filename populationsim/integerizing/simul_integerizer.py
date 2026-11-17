@@ -178,13 +178,15 @@ class SimulIntegerizer:
 
         # fork: seeded order-sampling keys replace ln(sub resid) in the LP
         # objective; with the draw off the call is exactly upstream's
+        draw_keys = None
         draw_kwargs = {}
         if self.draw_method != "off":
-            draw_kwargs["draw_keys"] = draw.draw_keys(
+            draw_keys = draw.draw_keys(
                 sub_resid_weights,
                 self.draw_method,
                 bs_options.call_rng("simul", self.trace_label),
             )
+            draw_kwargs["draw_keys"] = draw_keys
 
         resid_weights_out, status_text = self.integerizer_func(
             sub_int_weights,
@@ -215,10 +217,26 @@ class SimulIntegerizer:
         integerized_weights = np.empty_like(sub_int_weights)
 
         sub_zone_count = len(self.sub_weights.columns)
-        for i in range(sub_zone_count):
-            integerized_weights[i] = smart_round(
-                sub_int_weights[i], resid_weights_out[i], total_household_controls[i]
+        if draw_keys is not None:
+            # fork: ties (and, after a failed LP, the positive residuals) are
+            # ordered by the same draw keys, row z per sub-zone
+            round_values = draw.rounding_values(
+                resid_weights_out, sub_resid_weights, status_text
             )
+        for i in range(sub_zone_count):
+            if draw_keys is None:
+                integerized_weights[i] = smart_round(
+                    sub_int_weights[i],
+                    resid_weights_out[i],
+                    total_household_controls[i],
+                )
+            else:
+                integerized_weights[i] = smart_round(
+                    sub_int_weights[i],
+                    round_values[i],
+                    total_household_controls[i],
+                    tie_keys=draw_keys[i],
+                )
 
         # integerized_weights df: one column of integerized weights per sub_zone
         self.integerized_weights = pd.DataFrame(

@@ -158,13 +158,16 @@ class Integerizer:
 
             # fork: seeded order-sampling keys replace ln(resid) in the LP
             # objective; with the draw off the call is exactly upstream's
+            draw_keys = None
             draw_kwargs = {}
             if self.draw_method != "off":
-                draw_kwargs["draw_keys"] = draw.draw_keys(
+                draw_keys = draw.draw_keys(
                     resid_weights,
                     self.draw_method,
                     bs_options.call_rng("single", self.trace_label),
                 )
+                draw_kwargs["draw_keys"] = draw_keys
+            input_resid_weights = resid_weights
 
             resid_weights, status = self.integerizer_func(
                 incidence=incidence,
@@ -179,9 +182,19 @@ class Integerizer:
                 **draw_kwargs,
             )
 
-            integerized_weights = smart_round(
-                int_weights, resid_weights, self.total_hh_control_value
-            )
+            if draw_keys is None:
+                integerized_weights = smart_round(
+                    int_weights, resid_weights, self.total_hh_control_value
+                )
+            else:
+                # fork: ties (and, after a failed LP, the positive residuals)
+                # are ordered by the same draw keys, not by row position
+                integerized_weights = smart_round(
+                    int_weights,
+                    draw.rounding_values(resid_weights, input_resid_weights, status),
+                    self.total_hh_control_value,
+                    tie_keys=draw_keys,
+                )
 
         self.weights = pd.DataFrame(index=self.incidence_table.index)
         self.weights["integerized_weight"] = integerized_weights
