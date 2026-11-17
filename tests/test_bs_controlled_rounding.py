@@ -3,6 +3,7 @@
 """Controlled rounding: targets and costs (pure numpy) and the controlled LP."""
 
 import dataclasses
+import logging
 
 import numpy as np
 import pytest
@@ -392,6 +393,47 @@ def _controlled(weights, incidence, household_controls, **kwargs):
     return problem, resid_out, status, stats, timing
 
 
+# stats of solve_controlled: those of solve_relaxation plus the attempts, the
+# repair and the problem's household counts
+CONTROLLED_STAT_KEYS = STAT_KEYS | {
+    "attempts",
+    "repaired_x",
+    "fractional_after_repair",
+    "repair_failed",
+    "repair_seconds",
+    "conserve_deviation_lp",
+    "conserve_deviation_repaired",
+    "objective_lp",
+    "objective_repaired",
+    "objective_seconds",
+    "hh_unreachable",
+    "hh_outside_lp",
+    "hh_excess",
+}
+
+
+def _controlled_repaired(weights, incidence, household_controls, **kwargs):
+    """As _controlled, through solve_controlled with the repair on."""
+    inputs = _inputs(weights, incidence, household_controls, **kwargs)
+    problem = cr.build_problem(**inputs)
+    timing = {}
+    resid_out, status, stats = controlled_lp.solve_controlled(
+        problem,
+        inputs["sub_incidence"],
+        inputs["parent_incidence"],
+        inputs["sub_float_weights"] % 1.0,
+        inputs["total_hh_sub_control_index"],
+        solver=SOLVER,
+        retry_solver="none",
+        repair=True,
+        timeout_seconds=60,
+        timing=timing,
+    )
+    assert set(stats) == CONTROLLED_STAT_KEYS
+    assert stats["solver"] == SOLVER
+    return problem, resid_out, status, stats, timing
+
+
 def _rounded(weights, resid_out, household_controls):
     """Integer weights (zones, rows) after smart_round per zone, as upstream."""
     weights = np.asarray(weights, dtype=np.float64)
@@ -537,9 +579,10 @@ def test_controlled_is_feasible_where_upstream_is_infeasible():
     np.testing.assert_array_equal(rounded[0], [0, 0, 1, 2])
 
 
-def _conservation_case():
+def _conservation_case(solve=_controlled):
     """Four zones; columns household total, c1, c2, persons; one parent control.
-    Rows 0 and 2 have parent weight 1, rows 1 and 3 parent weight 2, row 4 7."""
+    Rows 0 and 2 have parent weight 1, rows 1 and 3 parent weight 2, row 4 7.
+    ``solve`` is _controlled (the LP alone) or _controlled_repaired."""
     incidence = np.array(
         [[1, 1, 0, 1], [1, 0, 1, 2], [1, 1, 1, 3], [1, 0, 0, 2], [1, 0, 1, 4]],
         dtype=np.float64,
@@ -555,7 +598,7 @@ def _conservation_case():
         ]
     ).T
     controls = [3, 3, 4, 3]
-    solved = _controlled(
+    solved = solve(
         weights,
         incidence,
         controls,
@@ -585,16 +628,20 @@ def test_controlled_conserves_parent_weight():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the LP optimum of this case is a fractional vertex (x = 0.5 for "
-    "rows 1 and 4 in zones 0 and 1); smart_round rounds each zone on its own "
-    "and moves one unit from row 1 to row 4, so the rounded weights lose the "
-    "conservation the LP solution has",
-)
 def test_controlled_rounding_keeps_parent_weight_at_a_fractional_vertex():
-    weights, all_incidence, controls, solved = _conservation_case()
+    # The LP optimum of this case is a fractional vertex (x = 0.5 for rows 1
+    # and 4 in zones 0 and 1). Handed to smart_round as it is, each zone is
+    # rounded on its own and one unit moves from row 1 to row 4. The repair
+    # rounds the fractional values jointly over zones and rows first.
+    *_, (_, _, _, lp_stats, _) = _conservation_case()
+    assert lp_stats["fractional_x"] > 0, "the case must have a fractional vertex"
+    weights, all_incidence, controls, solved = _conservation_case(_controlled_repaired)
     problem, resid_out, status, stats, _ = solved
+    assert status in STATUS_SUCCESS
+    assert stats["repaired_x"] == lp_stats["fractional_x"]
+    assert stats["fractional_after_repair"] == 0
+    assert stats["repair_failed"] == 0
+    assert stats["conserve_deviation_repaired"] == 0.0
     rounded = _rounded(weights, resid_out, controls)
     np.testing.assert_array_equal(rounded.sum(axis=1), controls)
     np.testing.assert_array_equal(rounded.sum(axis=0), [1, 2, 1, 2, 7])
@@ -1071,3 +1118,333 @@ def test_assemble_refuses_a_conservation_target_without_variables():
     broken = dataclasses.replace(problem, conserve_target=target)
     with pytest.raises(ValueError, match="conserve_target"):
         controlled_lp.assemble(broken, inc, pinc, 0)
+
+
+# --- repair of fractional LP values, retry with a second solver --------------
+
+
+def _two_by_two(keys):
+    """Two zones, two rows of parent weight 1 (weights 0.7 / 0.3 and 0.3 /
+    0.7), only the household total: (problem, lp). One household per zone,
+    every row conserves 1; x in the order x[0, 0], x[0, 1], x[1, 0], x[1, 1]."""
+    problem = _build([[0.7, 0.3], [0.3, 0.7]], [[1], [1]], [1, 1], keys=keys)
+    lp = controlled_lp.assemble(problem, np.ones((2, 1)), np.zeros((2, 0)), 0)
+    return problem, lp
+
+
+# keys at the clip limit for the points (x[0, 1], x[1, 0]) and (x[0, 0], x[1, 1])
+KEYS_OFF_DIAGONAL = [[0.0, cr.KEY_CLIP], [cr.KEY_CLIP, 0.0]]
+KEYS_DIAGONAL = [[cr.KEY_CLIP, 0.0], [0.0, cr.KEY_CLIP]]
+
+
+@pytest.mark.parametrize(
+    "values,expected",
+    [([0.7, 0.3, 0.3, 0.7], [1, 0, 0, 1]), ([0.3, 0.7, 0.7, 0.3], [0, 1, 1, 0])],
+)
+def test_repair_minimises_the_distance_to_the_lp_values(values, expected):
+    # Two integer points keep the zone counts and the row totals. The L1
+    # distance to the LP values decides (1.2 against 2.8), whatever the keys
+    # favour: they only break ties.
+    for keys in (KEYS_OFF_DIAGONAL, KEYS_DIAGONAL):
+        problem, lp = _two_by_two(keys)
+        x, stats = controlled_lp.repair_fractional(
+            lp, np.array(values), problem, SOLVER, 60
+        )
+        np.testing.assert_array_equal(x, expected)
+        assert stats["repaired_x"] == 4
+        assert stats["fractional_after_repair"] == 0
+        assert stats["repair_failed"] == 0
+        assert stats["conserve_deviation_lp"] == pytest.approx(0.0, abs=1e-12)
+        assert stats["conserve_deviation_repaired"] == 0.0
+        assert stats["repair_seconds"] >= 0.0
+
+
+@pytest.mark.parametrize(
+    "keys,expected",
+    [(KEYS_OFF_DIAGONAL, [0, 1, 1, 0]), (KEYS_DIAGONAL, [1, 0, 0, 1])],
+)
+def test_repair_breaks_ties_by_the_lp_coefficients(keys, expected):
+    # x = 0.5 everywhere: both integer points are at L1 distance 2, the LP's
+    # own x coefficients (here the keys) decide
+    problem, lp = _two_by_two(keys)
+    x, stats = controlled_lp.repair_fractional(lp, np.full(4, 0.5), problem, SOLVER, 60)
+    np.testing.assert_array_equal(x, expected)
+
+
+def test_repair_without_fractional_values_only_snaps(monkeypatch):
+    def no_solver(*args, **kwargs):
+        raise AssertionError("no repair LP without fractional values")
+
+    problem, lp = _two_by_two(KEYS_DIAGONAL)
+    monkeypatch.setattr(controlled_lp, "solve_lp", no_solver)
+    values = np.array([1.0 - 1e-9, 1e-9, -1e-12, 1.0])
+    x, stats = controlled_lp.repair_fractional(lp, values, problem, SOLVER, 60)
+    np.testing.assert_array_equal(x, [1, 0, 0, 1])
+    assert stats["repaired_x"] == 0
+    assert stats["fractional_after_repair"] == 0
+    assert stats["repair_failed"] == 0
+
+
+def test_repair_refuses_values_that_miss_the_zone_counts():
+    problem, lp = _two_by_two(KEYS_DIAGONAL)
+    with pytest.raises(ValueError, match="zone"):
+        controlled_lp.repair_fractional(
+            lp, np.array([0.7, 0.3, 0.3, 0.3]), problem, SOLVER, 60
+        )
+    with pytest.raises(ValueError, match="x_values"):
+        controlled_lp.repair_fractional(
+            lp, np.array([0.5, 0.5, 0.5]), problem, SOLVER, 60
+        )
+
+
+def test_repair_returns_integers_with_exact_zone_counts():
+    # The bound on conservation that the repair guarantees, per household row
+    # h with LP total T_h = sum_z x and integer target K_h: the repair keeps
+    # T_h where it is integral and moves it to floor(T_h) or ceil(T_h)
+    # otherwise, so, K_h being an integer, |T'_h - K_h| <= ceil(|T_h - K_h|).
+    # Summed over the rows: the deviation after the repair is at most the
+    # deviation of the LP plus the number of rows whose LP total is
+    # fractional (rows with a fractional conservation slack), strictly less
+    # when there is any; rows the LP conserves stay conserved.
+    tolerance = controlled_lp.FRACTIONAL_TOLERANCE
+    fractional_cases = 0
+    for seed in range(30):
+        problem, inc, pinc, _, _, weights = _random_case(seed)
+        lp = controlled_lp.assemble(problem, inc, pinc, 0)
+        result = controlled_lp.solve_lp(lp, SOLVER, 60)
+        assert result.status_text in STATUS_SUCCESS
+        x_lp = result.values[lp.blocks["x"]]
+        fractional = (x_lp > tolerance) & (x_lp < 1.0 - tolerance)
+        if not fractional.any():
+            continue
+        fractional_cases += 1
+
+        x, stats = controlled_lp.repair_fractional(lp, x_lp, problem, SOLVER, 60)
+        assert stats["repair_failed"] == 0
+        assert stats["repaired_x"] == int(fractional.sum())
+        assert stats["fractional_after_repair"] == 0
+        assert np.isin(x, [0.0, 1.0]).all()
+        np.testing.assert_array_equal(x[~fractional], np.round(x_lp[~fractional]))
+        grid = np.zeros(problem.x_allowed.shape)
+        grid[problem.x_allowed] = x
+        np.testing.assert_array_equal(grid.sum(axis=1), problem.hh_count)
+
+        # smart_round rounds up the hh_count[z] largest values of a zone:
+        # exactly the repaired ones, so it changes nothing
+        a = weights.astype(int)
+        for z in range(grid.shape[0]):
+            rounded = smart_round(a[z], grid[z], a[z].sum() + problem.hh_count[z])
+            np.testing.assert_array_equal(rounded, a[z] + grid[z])
+
+        lp_grid = np.zeros(problem.x_allowed.shape)
+        lp_grid[problem.x_allowed] = x_lp
+        dev_lp = np.abs(lp_grid.sum(axis=0) - problem.conserve_target)
+        dev_repaired = np.abs(grid.sum(axis=0) - problem.conserve_target)
+        assert (dev_repaired <= np.ceil(dev_lp - 1e-6) + 1e-9).all()
+        fractional_rows = int((np.abs(dev_lp - np.round(dev_lp)) > 1e-6).sum())
+        assert stats["conserve_deviation_lp"] == pytest.approx(dev_lp.sum(), abs=1e-9)
+        assert stats["conserve_deviation_repaired"] == pytest.approx(
+            dev_repaired.sum(), abs=1e-9
+        )
+        assert (
+            stats["conserve_deviation_repaired"]
+            <= stats["conserve_deviation_lp"] + fractional_rows + 1e-9
+        )
+    assert fractional_cases >= 10
+
+
+def _failed(status_text):
+    return controlled_lp.LpResult(status_text, None, float("nan"), 0.25)
+
+
+@pytest.mark.parametrize("failure", ["status", "not integral"])
+def test_repair_failure_keeps_the_lp_values_and_is_counted(
+    failure, monkeypatch, caplog
+):
+    def failing(arrays, solver, timeout_seconds, **kwargs):
+        if failure == "status":
+            return _failed("NOT_SOLVED")
+        values = np.full(arrays.objective.size, 0.5)
+        return controlled_lp.LpResult(STATUS_OPTIMAL, values, 0.0, 0.0)
+
+    problem, lp = _two_by_two(KEYS_DIAGONAL)
+    values = np.array([0.6, 0.4, 0.4, 0.6])
+    monkeypatch.setattr(controlled_lp, "solve_lp", failing)
+    with caplog.at_level(logging.WARNING, logger=controlled_lp.logger.name):
+        x, stats = controlled_lp.repair_fractional(lp, values, problem, SOLVER, 60)
+    np.testing.assert_array_equal(x, values)
+    assert stats["repair_failed"] == 1
+    assert stats["repaired_x"] == 4
+    assert stats["fractional_after_repair"] == 4
+    assert stats["conserve_deviation_repaired"] == stats["conserve_deviation_lp"]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "repair" in message
+    assert ("NOT_SOLVED" if failure == "status" else "not integral") in message
+
+
+def test_repair_failure_in_solve_controlled_hands_on_the_lp_values(monkeypatch):
+    lp_out = _conservation_case()[3][1]
+    original = controlled_lp.solve_lp
+
+    def failing_repair(lp, solver, timeout_seconds, **kwargs):
+        # the repair LP is the only one that is not a LinearProgram
+        if isinstance(lp, controlled_lp.LinearProgram):
+            return original(lp, solver, timeout_seconds, **kwargs)
+        return _failed("ABNORMAL")
+
+    monkeypatch.setattr(controlled_lp, "solve_lp", failing_repair)
+    *_, (problem, resid_out, status, stats, _) = _conservation_case(
+        _controlled_repaired
+    )
+    assert status in STATUS_SUCCESS
+    assert stats["repair_failed"] == 1
+    assert stats["fractional_after_repair"] == stats["fractional_x"] > 0
+    assert np.isnan(stats["objective_repaired"])
+    np.testing.assert_array_equal(resid_out, lp_out)
+
+
+def _patch_failures(monkeypatch, failures):
+    """solve_lp fails for the solver names in ``failures`` (name -> status);
+    returns the list of solver names called."""
+    original = controlled_lp.solve_lp
+    calls = []
+
+    def solve(lp, solver, timeout_seconds, **kwargs):
+        calls.append(solver)
+        if solver in failures:
+            return _failed(failures[solver])
+        return original(lp, solver, timeout_seconds, **kwargs)
+
+    monkeypatch.setattr(controlled_lp, "solve_lp", solve)
+    return calls
+
+
+# stats that are measured times
+SECONDS = {"repair_seconds", "objective_seconds"}
+
+
+def test_retry_uses_the_second_solver_and_records_it(monkeypatch, caplog):
+    problem, inc, pinc, resid, _, _ = _random_case(0)
+    direct_out, direct_status, direct_stats = controlled_lp.solve_controlled(
+        problem, inc, pinc, resid, 0, "clp-dual", "none", True, 60
+    )
+    calls = _patch_failures(monkeypatch, {"highs-ds": "NOT_SOLVED"})
+    timing = {}
+    with caplog.at_level(logging.WARNING, logger=controlled_lp.logger.name):
+        resid_out, status, stats = controlled_lp.solve_controlled(
+            problem, inc, pinc, resid, 0, "highs-ds", "clp-dual", True, 60, timing
+        )
+    assert calls[:2] == ["highs-ds", "clp-dual"]
+    assert "highs-ds" not in calls[2:]
+    assert status == direct_status == STATUS_OPTIMAL
+    assert stats["attempts"] == 2
+    assert direct_stats["attempts"] == 1
+    assert stats["solver"] == "clp-dual"
+    np.testing.assert_array_equal(resid_out, direct_out)
+    assert {k: v for k, v in stats.items() if k not in SECONDS | {"attempts"}} == {
+        k: v for k, v in direct_stats.items() if k not in SECONDS | {"attempts"}
+    }
+    assert timing["solve_s"] >= 0.25  # the failed attempt counts
+    message = " ".join(
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    )
+    for token in ("highs-ds", "NOT_SOLVED", "clp-dual", "OPTIMAL"):
+        assert token in message
+
+
+def test_retry_none_returns_the_first_failure(monkeypatch):
+    problem, inc, pinc, resid, _, _ = _random_case(0)
+    calls = _patch_failures(monkeypatch, {"highs-ds": "INFEASIBLE"})
+    resid_out, status, stats = controlled_lp.solve_controlled(
+        problem, inc, pinc, resid, 0, "highs-ds", "none", True, 60
+    )
+    assert calls == ["highs-ds"]
+    assert status == "INFEASIBLE"
+    assert resid_out is resid
+    assert stats["attempts"] == 1
+    assert stats["solver"] == "highs-ds"
+    assert stats["repaired_x"] == 0
+    assert stats["repair_failed"] == 0
+    assert np.isnan(stats["objective_lp"])
+    assert np.isnan(stats["objective_repaired"])
+    assert stats["hh_outside_lp"] == problem.hh_outside_lp
+
+    # a retry solver equal to the first is no second attempt
+    _, _, stats = controlled_lp.solve_controlled(
+        problem, inc, pinc, resid, 0, "highs-ds", "highs-ds", True, 60
+    )
+    assert stats["attempts"] == 1
+    # an unknown retry solver is refused before any solve
+    with pytest.raises(ValueError, match="INTEGERIZER_CONTROLLED_RETRY_SOLVER"):
+        controlled_lp.solve_controlled(
+            problem, inc, pinc, resid, 0, "highs-ds", "gurobi", True, 60
+        )
+
+
+def test_both_solvers_failing_returns_the_input_residuals(monkeypatch, caplog):
+    problem, inc, pinc, resid, _, _ = _random_case(0)
+    calls = _patch_failures(
+        monkeypatch, {"highs-ds": "INFEASIBLE", "clp-dual": "ABNORMAL"}
+    )
+    with caplog.at_level(logging.WARNING, logger=controlled_lp.logger.name):
+        resid_out, status, stats = controlled_lp.solve_controlled(
+            problem, inc, pinc, resid, 0, "highs-ds", "clp-dual", True, 60
+        )
+    assert calls == ["highs-ds", "clp-dual"]
+    assert status == "ABNORMAL"
+    assert resid_out is resid
+    assert stats["attempts"] == 2
+    assert stats["solver"] == "clp-dual"
+    assert stats["fractional_x"] == 0
+    assert stats["repaired_x"] == 0
+    message = " ".join(
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    )
+    assert "INFEASIBLE" in message and "ABNORMAL" in message
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, INTEGRAL_SEEDS[0]])
+def test_integrality_loss_is_reported(seed):
+    problem, inc, pinc, resid, keys, weights = _random_case(seed)
+    resid_out, status, stats = controlled_lp.solve_controlled(
+        problem, inc, pinc, resid, 0, SOLVER, "none", True, 60
+    )
+    assert status in STATUS_SUCCESS
+    assert set(stats) == CONTROLLED_STAT_KEYS
+    lp = controlled_lp.assemble(problem, inc, pinc, 0)
+    relaxed = controlled_lp.solve_lp(lp, SOLVER, 60)
+    assert stats["objective_lp"] == pytest.approx(relaxed.objective, rel=1e-9)
+
+    # the repaired x, fixed through its bounds, with the slacks re-optimised
+    x = resid_out[problem.x_allowed]
+    assert np.isin(x, [0.0, 1.0]).all()
+    lower = np.array(lp.lower)
+    upper = np.array(lp.upper)
+    lower[lp.blocks["x"]] = x
+    upper[lp.blocks["x"]] = x
+    fixed = controlled_lp.solve_lp(
+        dataclasses.replace(lp, lower=lower, upper=upper), SOLVER, 60
+    )
+    assert fixed.status_text in STATUS_SUCCESS
+    assert stats["objective_repaired"] == pytest.approx(
+        fixed.objective, rel=1e-9, abs=1e-6
+    )
+    # and from the definitions, independent of the LP arrays
+    expected = _cost_of(
+        resid_out, problem, weights, inc, pinc, keys, problem.conserve_penalty
+    )
+    assert stats["objective_repaired"] == pytest.approx(expected, rel=1e-9, abs=1e-6)
+    # the LP optimum is an upper bound of every integer solution
+    slack = 1e-9 * max(1.0, abs(stats["objective_lp"]))
+    assert stats["objective_repaired"] <= stats["objective_lp"] + slack
+    if seed in INTEGRAL_SEEDS:
+        assert stats["repaired_x"] == 0
+        assert stats["objective_repaired"] == pytest.approx(
+            stats["objective_lp"], rel=1e-9
+        )
+    else:
+        assert stats["repaired_x"] > 0
+    for name in ("hh_unreachable", "hh_outside_lp", "hh_excess"):
+        assert stats[name] == getattr(problem, name)

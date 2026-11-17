@@ -172,3 +172,75 @@ def test_options_log_controlled_values(settings, caplog):
     msg = " ".join(r.getMessage() for r in caplog.records)
     assert "rounding=controlled" in msg
     assert "100000.0" in msg and "penalty_floor" in msg
+
+
+def test_controlled_solver_settings_defaults(settings):
+    assert bs_options.controlled_solver() == "highs-ipm"
+    assert bs_options.controlled_retry_solver() == "clp-dual"
+    assert bs_options.controlled_repair() is True
+
+
+def test_controlled_solver_settings_accept_every_solver(settings):
+    from populationsim.integerizing.constants import CONTROLLED_SOLVERS
+
+    for name in CONTROLLED_SOLVERS:
+        settings["INTEGERIZER_CONTROLLED_SOLVER"] = name
+        settings["INTEGERIZER_CONTROLLED_RETRY_SOLVER"] = "none"
+        assert bs_options.controlled_solver() == name
+        assert bs_options.controlled_retry_solver() == "none"
+    settings["INTEGERIZER_CONTROLLED_SOLVER"] = "clp-dual"
+    settings["INTEGERIZER_CONTROLLED_RETRY_SOLVER"] = "highs-ds"
+    assert bs_options.controlled_retry_solver() == "highs-ds"
+    settings["INTEGERIZER_CONTROLLED_REPAIR"] = False
+    assert bs_options.controlled_repair() is False
+
+
+@pytest.mark.parametrize(
+    "key,bad",
+    [
+        ("INTEGERIZER_CONTROLLED_SOLVER", "highs"),
+        ("INTEGERIZER_CONTROLLED_SOLVER", "none"),
+        ("INTEGERIZER_CONTROLLED_SOLVER", "HIGHS-IPM"),
+        ("INTEGERIZER_CONTROLLED_SOLVER", 1),
+        ("INTEGERIZER_CONTROLLED_RETRY_SOLVER", "gurobi"),
+        ("INTEGERIZER_CONTROLLED_RETRY_SOLVER", None),
+        ("INTEGERIZER_CONTROLLED_RETRY_SOLVER", False),
+        ("INTEGERIZER_CONTROLLED_REPAIR", "yes"),
+        ("INTEGERIZER_CONTROLLED_REPAIR", 1),
+    ],
+)
+def test_controlled_solver_settings_reject_invalid(settings, key, bad):
+    settings[key] = bad
+    reader = {
+        "INTEGERIZER_CONTROLLED_SOLVER": bs_options.controlled_solver,
+        "INTEGERIZER_CONTROLLED_RETRY_SOLVER": bs_options.controlled_retry_solver,
+        "INTEGERIZER_CONTROLLED_REPAIR": bs_options.controlled_repair,
+    }[key]
+    with pytest.raises(ValueError, match=key):
+        reader()
+
+
+def test_controlled_retry_solver_must_differ(settings):
+    settings["INTEGERIZER_CONTROLLED_SOLVER"] = "clp-dual"
+    with pytest.raises(ValueError) as exc:
+        bs_options.controlled_retry_solver()
+    assert "INTEGERIZER_CONTROLLED_RETRY_SOLVER" in str(exc.value)
+    assert "INTEGERIZER_CONTROLLED_SOLVER" in str(exc.value)
+
+
+def test_options_log_controlled_solver_values(settings, caplog):
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    settings["INTEGERIZER_CONTROLLED_REPAIR"] = False
+    with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
+        bs_options.log_options_once()
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "controlled_solver=highs-ipm" in msg
+    assert "controlled_retry_solver=clp-dual" in msg
+    assert "controlled_repair=False" in msg
+
+
+def test_options_log_omits_solver_values_in_round_mode(settings, caplog):
+    with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
+        bs_options.log_options_once()
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "controlled_solver" not in msg

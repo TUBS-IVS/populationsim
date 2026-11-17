@@ -15,6 +15,7 @@ import numpy as np
 
 from populationsim.core import config
 from populationsim.core.random import hash32
+from populationsim.integerizing.constants import CONTROLLED_SOLVERS
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,12 @@ CVXPY_ROUNDING_MESSAGE = (
     "INTEGERIZER_ROUNDING=controlled requires the OR-Tools integerizer "
     "(USE_CVXPY false)"
 )
+CONTROLLED_SOLVER_NAME = "INTEGERIZER_CONTROLLED_SOLVER"
+CONTROLLED_RETRY_SOLVER_NAME = "INTEGERIZER_CONTROLLED_RETRY_SOLVER"
+CONTROLLED_REPAIR_NAME = "INTEGERIZER_CONTROLLED_REPAIR"
+DEFAULT_CONTROLLED_SOLVER = "highs-ipm"
+DEFAULT_CONTROLLED_RETRY_SOLVER = "clp-dual"
+NO_RETRY = "none"
 
 _logged = False
 
@@ -45,9 +52,7 @@ def integerizer_timeout_seconds():
             f"{TIMEOUT_NAME}={new!r} and {TIMEOUT_ALIAS}={old!r} are both set "
             f"with different values; set only one of them"
         )
-    name, value = (
-        (TIMEOUT_NAME, new) if new is not None else (TIMEOUT_ALIAS, old)
-    )
+    name, value = (TIMEOUT_NAME, new) if new is not None else (TIMEOUT_ALIAS, old)
     if value is None:
         return DEFAULT_TIMEOUT_SECONDS
     if not _is_int(value) or value <= 0:
@@ -131,17 +136,63 @@ def penalty_settings():
             f"INTEGERIZER_PARENT_TOTAL_FACTOR must be >= 1, got {factor!r}"
         )
     if conserve < 0:
-        raise ValueError(
-            f"INTEGERIZER_CONSERVE_PENALTY must be >= 0, got {conserve!r}"
-        )
+        raise ValueError(f"INTEGERIZER_CONSERVE_PENALTY must be >= 0, got {conserve!r}")
     return PenaltySettings(floor, cap, factor, conserve)
 
 
-def _flag(key):
-    value = config.setting(key, False)
+def _flag(key, default=False):
+    value = config.setting(key, default)
     if not isinstance(value, (bool, np.bool_)):
         raise ValueError(f"{key} must be true or false, got {value!r}")
     return bool(value)
+
+
+def _solver_name(key, default, allowed):
+    value = config.setting(key, default)
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"{key} must be one of {allowed}, got {value!r}")
+    return value
+
+
+def controlled_solver():
+    """``INTEGERIZER_CONTROLLED_SOLVER``: LP solver of the controlled rounding.
+
+    One of :data:`populationsim.integerizing.constants.CONTROLLED_SOLVERS`
+    (default ``highs-ipm``); whether the environment provides it is checked
+    when it is first used (``controlled_lp.solve_lp``).
+    """
+    return _solver_name(
+        CONTROLLED_SOLVER_NAME, DEFAULT_CONTROLLED_SOLVER, CONTROLLED_SOLVERS
+    )
+
+
+def controlled_retry_solver():
+    """``INTEGERIZER_CONTROLLED_RETRY_SOLVER``: solver of the second attempt.
+
+    Solves the same LP once more when the first solver ends without success;
+    a solver name (default ``clp-dual``) or ``none`` (no second attempt). It
+    must differ from ``INTEGERIZER_CONTROLLED_SOLVER``.
+    """
+    value = _solver_name(
+        CONTROLLED_RETRY_SOLVER_NAME,
+        DEFAULT_CONTROLLED_RETRY_SOLVER,
+        CONTROLLED_SOLVERS + (NO_RETRY,),
+    )
+    first = controlled_solver()
+    if value == first:
+        raise ValueError(
+            f"{CONTROLLED_RETRY_SOLVER_NAME} must differ from "
+            f"{CONTROLLED_SOLVER_NAME} (both {value!r}); set it to another "
+            f"solver or to {NO_RETRY!r}"
+        )
+    return value
+
+
+def controlled_repair():
+    """``INTEGERIZER_CONTROLLED_REPAIR`` (default True): round the fractional
+    values of the controlled LP jointly (``controlled_lp.repair_fractional``)
+    before ``smart_round``."""
+    return _flag(CONTROLLED_REPAIR_NAME, True)
 
 
 def keep_fractional_sample_weights():
@@ -187,9 +238,13 @@ def log_options_once():
     if mode == "controlled":
         message += (
             " penalty_floor=%s penalty_cap=%s parent_total_factor=%s "
-            "conserve_penalty=%s"
+            "conserve_penalty=%s controlled_solver=%s "
+            "controlled_retry_solver=%s controlled_repair=%s"
         )
         args.extend(penalty_settings())
+        args.extend(
+            [controlled_solver(), controlled_retry_solver(), controlled_repair()]
+        )
     logger.info(message, *args)
 
 
