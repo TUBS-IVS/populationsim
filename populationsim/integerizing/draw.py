@@ -61,6 +61,10 @@ DRAW_KEY_METHODS = ("pareto", "gumbel")
 LOG_OVERFLOW = -725
 RESID_UPPER = 1.0 - 1e-12
 
+# LP solution values are rounded to this many decimals before they order the
+# rows in smart_round, so that solver noise cannot outrank the draw keys.
+LP_VALUE_DECIMALS = 9
+
 CVXPY_MESSAGE = "INTEGERIZER_DRAW requires the OR-Tools integerizer (USE_CVXPY false)"
 
 
@@ -101,12 +105,17 @@ def draw_keys(
 def rounding_values(lp_resid_weights, input_resid_weights, status):
     """Primary sort values for ``smart_round`` when the draw is on.
 
-    LP success: the LP solution itself. LP failure (the LP then returns the
+    LP success: the LP solution rounded to ``LP_VALUE_DECIMALS`` decimals. The
+    LP variables are continuous, so simplex noise (1e-16 instead of 0,
+    0.9999999999 instead of 1) would otherwise beat the keys among ties;
+    genuine fractional values are kept. LP failure (the LP then returns the
     input residuals): ``1.0`` where the input residual is positive, else
     ``0.0``, so that the keys (``tie_keys``) decide among those households.
     """
     if status in STATUS_SUCCESS:
-        return lp_resid_weights
+        return np.round(
+            np.asarray(lp_resid_weights, dtype=np.float64), LP_VALUE_DECIMALS
+        )
     return (np.asarray(input_resid_weights) > 0).astype(np.float64)
 
 

@@ -505,6 +505,39 @@ def test_smart_round_tie_keys():
         smart_round(int_weights, lp_values, target, tie_keys=keys[:-1])
 
 
+def test_lp_noise_does_not_beat_the_keys():
+    """Simplex noise around 0 and 1 must not decide the rounding order."""
+    int_weights = np.zeros(6, dtype=int)
+    exact = np.array([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    noisy = exact + np.array([0.0, -1e-10, 0.0, 0.0, 1e-16, 0.0])
+    keys = np.array([0.1, 0.2, 3.0, 1.0, -5.0, 2.0])
+    resid = np.full(6, 0.5)
+    assert noisy[1] < 1.0 and noisy[4] > 0.0
+    values = draw.rounding_values(noisy, resid, "OPTIMAL")
+    np.testing.assert_array_equal(values, exact)
+
+    # One extra row beyond the two LP rows: the largest key among the zeros
+    # (row 2), not the row carrying +1e-16 (row 4, smallest key).
+    got = smart_round(int_weights, values, 3, tie_keys=keys)
+    assert set(np.flatnonzero(got).tolist()) == {0, 1, 2}
+    # Only one of the two LP rows: the larger key (row 1, value 0.9999999999).
+    got = smart_round(int_weights, values, 1, tie_keys=keys)
+    assert set(np.flatnonzero(got).tolist()) == {1}
+    # Positive control: on the raw noisy values the noise decides.
+    raw = smart_round(int_weights, noisy, 3, tie_keys=keys)
+    assert set(np.flatnonzero(raw).tolist()) == {0, 1, 4}
+
+    # Genuine fractional LP values survive; the failure branch is unchanged.
+    fractional = np.array([0.5, 0.25, 1.0, 0.0, 0.75, 0.0])
+    np.testing.assert_array_equal(
+        draw.rounding_values(fractional, resid, "FEASIBLE"), fractional
+    )
+    np.testing.assert_array_equal(
+        draw.rounding_values(noisy, np.array([0.3, 0, 0.1, 0, 0, 0.9]), "INFEASIBLE"),
+        [1.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+    )
+
+
 @pytest.mark.parametrize("method", METHODS)
 def test_rounding_extra_rows_follow_keys_single(settings, method):
     """LP total below the rounding target: the extra rows follow the keys."""
