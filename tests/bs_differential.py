@@ -6,6 +6,8 @@ Not a test module (no ``test_`` prefix). The example runs in a subprocess so
 that ``populationsim`` is imported from exactly one code root per run.
 """
 
+from __future__ import annotations
+
 import io
 import os
 import subprocess
@@ -81,7 +83,13 @@ def export_tag(tag: str, dest: Path) -> Path:
             f"run `git fetch --tags` and retry"
         )
     with tarfile.open(fileobj=io.BytesIO(proc.stdout)) as tar:
-        tar.extractall(dest, filter="data")
+        # The archive comes from our own git tag, not from untrusted input; the
+        # "data" filter is only a hardening where the interpreter offers it
+        # (Python 3.9 has no filter argument).
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(dest, filter="data")
+        else:
+            tar.extractall(dest)
     return dest
 
 
@@ -100,6 +108,8 @@ def run_example(
     overrides = {"inherit_settings": True, **(settings_overrides or {})}
     (configs_tmp / "settings.yaml").write_text(yaml.safe_dump(overrides))
 
+    # On purpose, both runs (tag code and working tree code) read tests/configs
+    # and examples/example_test from the working tree: only the code differs.
     env = dict(os.environ)
     env["PYTHONPATH"] = str(code_root)
     proc = subprocess.run(

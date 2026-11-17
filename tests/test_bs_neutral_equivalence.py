@@ -17,3 +17,17 @@ def test_defaults_match_v0_10_0(tmp_path):
     assert _canonical(base).equals(
         _canonical(new)
     ), f"rows tag={len(base)} tree={len(new)}"
+
+
+def test_differential_detects_a_change(tmp_path):
+    """Positive control: an override that changes the result makes the frames differ."""
+    base = run_example(REPO_ROOT, tmp_path / "out_default")
+    changed = run_example(
+        REPO_ROOT,
+        tmp_path / "out_changed",
+        {"INTEGERIZE_WITH_BACKSTOPPED_CONTROLS": False},
+    )
+    assert len(base) > 0 and len(changed) > 0
+    assert not _canonical(base).equals(
+        _canonical(changed)
+    ), f"override had no effect: rows default={len(base)} changed={len(changed)}"
