@@ -1,12 +1,14 @@
 # PopulationSim
 # See full license in LICENSE.txt.
-"""Targets and costs of the controlled rounding (pure numpy, no solver)."""
+"""Controlled rounding: targets and costs (pure numpy) and the controlled LP."""
 
 import numpy as np
 import pytest
 
 from populationsim.integerizing import controlled_rounding as cr
+from populationsim.integerizing import lp_ortools
 from populationsim.integerizing.bs_options import PenaltySettings
+from populationsim.integerizing.constants import STATUS_OPTIMAL, STATUS_SUCCESS
 from populationsim.integerizing.smart_round import smart_round
 
 PENALTIES = PenaltySettings(
@@ -238,3 +240,336 @@ def test_build_problem_rejects_invalid_inputs(change, name):
     change(kwargs)
     with pytest.raises(ValueError, match=name):
         cr.build_problem(**kwargs)
+
+
+# --- the controlled LP -------------------------------------------------------
+
+STAT_KEYS = {
+    "x_count",
+    "fractional_x",
+    "slack_cell",
+    "slack_parent_sub",
+    "slack_parent",
+    "slack_conserve",
+}
+
+
+def _log_keys(weights):
+    """Upstream's household keys: ln(sub residual) + ln(summed residual)."""
+    resid = np.asarray(weights, dtype=np.float64) % 1.0
+    floor = np.exp(-725)  # upstream's LOG_OVERFLOW
+    return np.log(np.maximum(resid, floor)) + np.log(
+        np.maximum(resid.sum(axis=0), floor)
+    )
+
+
+def _controlled(weights, incidence, household_controls, **kwargs):
+    """Build the problem and solve the controlled LP as the integerizer will."""
+    inputs = _inputs(weights, incidence, household_controls, **kwargs)
+    problem = cr.build_problem(**inputs)
+    timing = {}
+    resid_out, status, stats = lp_ortools.np_simul_integerizer_controlled_ortools(
+        problem,
+        inputs["sub_incidence"],
+        inputs["parent_incidence"],
+        inputs["sub_float_weights"] % 1.0,
+        inputs["total_hh_sub_control_index"],
+        timeout_in_seconds=60,
+        timing=timing,
+    )
+    assert set(stats) == STAT_KEYS
+    return problem, resid_out, status, stats, timing
+
+
+def _rounded(weights, resid_out, household_controls):
+    """Integer weights (zones, rows) after smart_round per zone, as upstream."""
+    weights = np.asarray(weights, dtype=np.float64)
+    int_weights = weights.astype(int)
+    return np.array(
+        [
+            smart_round(int_weights[z], resid_out[z], household_controls[z])
+            for z in range(weights.shape[0])
+        ]
+    )
+
+
+def _upstream_inputs(
+    weights, sub_incidence, sub_importance, parent_incidence, parent_importance
+):
+    """Arguments of np_simul_integerizer_ortools, derived exactly as
+    SimulIntegerizer.integerize derives them (household total in column 0)."""
+    total_hh_sub_control_index = 0
+    sub_float_weights = np.asarray(weights, dtype=np.float64)
+    sub_incidence = np.asarray(sub_incidence, dtype=np.float64)
+    parent_incidence = np.asarray(parent_incidence, dtype=np.float64)
+    sub_int_weights = sub_float_weights.astype(int)
+    sub_resid_weights = sub_float_weights % 1.0
+    sub_control_importance = np.array(sub_importance, dtype=np.float64)
+
+    relaxed_sub_control_totals = np.dot(sub_float_weights, sub_incidence)
+    lp_right_hand_side = np.round(relaxed_sub_control_totals) - np.dot(
+        sub_int_weights, sub_incidence
+    )
+    lp_right_hand_side = np.maximum(lp_right_hand_side, 0.0)
+    sub_num_households = relaxed_sub_control_totals[:, (total_hh_sub_control_index,)]
+    sub_max_control_values = np.amax(sub_incidence, axis=0) * sub_num_households
+    relax_ge_upper_bound = np.maximum(sub_max_control_values - lp_right_hand_side, 0)
+    hh_constraint_ge_bound = np.maximum(sub_max_control_values, lp_right_hand_side)
+    total_hh_right_hand_side = lp_right_hand_side[:, total_hh_sub_control_index]
+
+    parent_float_weights = np.sum(sub_float_weights, axis=0)
+    parent_int_weights = np.sum(sub_int_weights, axis=0)
+    parent_resid_weights = np.sum(sub_resid_weights, axis=0)
+    relaxed_parent_control_totals = np.dot(parent_float_weights, parent_incidence)
+    parent_countrol_importance = np.array(parent_importance, dtype=np.float64)
+    parent_lp_right_hand_side = np.round(relaxed_parent_control_totals) - np.dot(
+        parent_int_weights, parent_incidence
+    )
+    parent_lp_right_hand_side = np.maximum(parent_lp_right_hand_side, 0.0)
+    parent_num_households = np.sum(sub_num_households)
+    parent_max_possible_control_values = (
+        np.amax(parent_incidence, axis=0) * parent_num_households
+    )
+    parent_relax_ge_upper_bound = np.maximum(
+        parent_max_possible_control_values - parent_lp_right_hand_side, 0
+    )
+    parent_hh_constraint_ge_bound = np.maximum(
+        parent_max_possible_control_values, parent_lp_right_hand_side
+    )
+    return dict(
+        sub_int_weights=sub_int_weights,
+        parent_countrol_importance=parent_countrol_importance,
+        parent_relax_ge_upper_bound=parent_relax_ge_upper_bound,
+        sub_control_importance=sub_control_importance,
+        sub_float_weights=sub_float_weights,
+        sub_resid_weights=sub_resid_weights,
+        lp_right_hand_side=lp_right_hand_side,
+        parent_hh_constraint_ge_bound=parent_hh_constraint_ge_bound,
+        sub_incidence=sub_incidence,
+        parent_incidence=parent_incidence,
+        total_hh_right_hand_side=total_hh_right_hand_side,
+        relax_ge_upper_bound=relax_ge_upper_bound,
+        parent_lp_right_hand_side=parent_lp_right_hand_side,
+        hh_constraint_ge_bound=hh_constraint_ge_bound,
+        parent_resid_weights=parent_resid_weights,
+        total_hh_sub_control_index=total_hh_sub_control_index,
+        total_hh_parent_control_index=-1,
+        timeout_in_seconds=60,
+    )
+
+
+def test_controlled_keeps_parent_total_of_rare_group():
+    # columns: household total, rare control, kind_a; ten zones of 3 households.
+    # Row 0 is the rare group (parent weight 1, F = 0.1 per zone); rows 1 and 2
+    # fill the zones (parent weights 14 and 15).
+    rare = 1
+    incidence = [[1, 1, 0], [1, 0, 1], [1, 0, 0]]
+    row_1 = [1.4, 1.2, 1.6, 1.3, 1.5, 1.4, 1.2, 1.6, 1.3, 1.5]
+    row_2 = [1.5, 1.7, 1.3, 1.6, 1.4, 1.5, 1.7, 1.3, 1.6, 1.4]
+    weights = np.array([[0.1] * 10, row_1, row_2]).T
+    controls = [3] * 10
+    importance = [1e9, 1000.0, 1000.0]
+
+    problem, resid_out, status, stats, _ = _controlled(
+        weights,
+        incidence,
+        controls,
+        importance=importance,
+        keys=_log_keys(weights),
+    )
+    assert status in STATUS_SUCCESS
+    rounded = _rounded(weights, resid_out, controls)
+    assert (rounded @ np.asarray(incidence))[:, rare].sum() == 1
+    np.testing.assert_array_equal(rounded.sum(axis=1), controls)
+    np.testing.assert_array_equal(rounded.sum(axis=0), [1, 14, 15])
+    assert stats["slack_parent_sub"] == pytest.approx(0.0, abs=1e-6)
+
+    # Upstream on the same data: its cell target np.round(F) of the rare
+    # control is 0 in every zone, and it bounds the slack relax_le by that
+    # target, so the rare row cannot be rounded up anywhere.
+    upstream = _upstream_inputs(
+        weights, incidence, importance, np.zeros((3, 0)), np.zeros(0)
+    )
+    np.testing.assert_array_equal(upstream["lp_right_hand_side"][:, rare], 0.0)
+    up_out, up_status = lp_ortools.np_simul_integerizer_ortools(**upstream)
+    assert up_status in STATUS_SUCCESS
+    up_rounded = _rounded(weights, up_out, controls)
+    assert (up_rounded @ np.asarray(incidence))[:, rare].sum() == 0
+
+
+def test_controlled_is_feasible_where_upstream_is_infeasible():
+    # columns: household total, c1, c2, c3. In zone 0 every row with a residual
+    # carries a control whose float total (0.3, 0.3, 0.4) rounds to 0, while the
+    # zone needs one more household (F_t = 3, integer part 2).
+    incidence = [[1, 1, 0, 0], [1, 0, 1, 0], [1, 0, 0, 1], [1, 0, 0, 0]]
+    weights = [[0.3, 0.3, 0.4, 2.0], [0.7, 0.7, 0.6, 1.0]]
+    controls = [3, 3]
+    importance = [1e9, 1000.0, 1000.0, 1000.0]
+
+    upstream = _upstream_inputs(
+        weights, incidence, importance, np.zeros((4, 0)), np.zeros(0)
+    )
+    assert upstream["total_hh_right_hand_side"][0] == 1
+    np.testing.assert_array_equal(upstream["lp_right_hand_side"][0, 1:], 0.0)
+    _, up_status = lp_ortools.np_simul_integerizer_ortools(**upstream)
+    assert up_status == "INFEASIBLE"
+
+    problem, resid_out, status, stats, _ = _controlled(
+        weights, incidence, controls, importance=importance
+    )
+    assert status in STATUS_SUCCESS
+    rounded = _rounded(weights, resid_out, controls)
+    np.testing.assert_array_equal(rounded.sum(axis=1), controls)
+    np.testing.assert_array_equal(rounded.sum(axis=0), [1, 1, 1, 3])
+    assert stats["slack_conserve"] == pytest.approx(0.0, abs=1e-6)
+    # the extra household of zone 0 is the row with the largest fraction (c3)
+    np.testing.assert_array_equal(rounded[0], [0, 0, 1, 2])
+
+
+def _conservation_case():
+    """Four zones; columns household total, c1, c2, persons; one parent control.
+    Rows 0 and 2 have parent weight 1, rows 1 and 3 parent weight 2, row 4 7."""
+    incidence = np.array(
+        [[1, 1, 0, 1], [1, 0, 1, 2], [1, 1, 1, 3], [1, 0, 0, 2], [1, 0, 1, 4]],
+        dtype=np.float64,
+    )
+    parent_incidence = np.array([[0], [1], [1], [0], [1]], dtype=np.float64)
+    weights = np.array(
+        [
+            [0.25, 0.25, 0.25, 0.25],
+            [0.6, 0.4, 0.5, 0.5],
+            [0.1, 0.2, 0.3, 0.4],
+            [0.5, 0.7, 0.2, 0.6],
+            [1.55, 1.45, 2.75, 1.25],
+        ]
+    ).T
+    controls = [3, 3, 4, 3]
+    solved = _controlled(
+        weights,
+        incidence,
+        controls,
+        importance=[1e9, 500.0, 2000.0, 300.0],
+        parent_incidence=parent_incidence,
+        parent_importance=[800.0],
+        keys=_log_keys(weights),
+    )
+    return weights, np.hstack([incidence, parent_incidence]), controls, solved
+
+
+def test_controlled_conserves_parent_weight():
+    # the LP solution itself: every row keeps its parent weight and every
+    # control (sub and parent) its float total over the zones
+    weights, all_incidence, controls, solved = _conservation_case()
+    problem, resid_out, status, stats, _ = solved
+    assert status in STATUS_SUCCESS
+    assert stats["x_count"] == 20
+    assert stats["slack_conserve"] == pytest.approx(0.0, abs=1e-6)
+    np.testing.assert_allclose(resid_out.sum(axis=1), problem.hh_count, atol=1e-6)
+    lp_weights = weights.astype(int) + resid_out
+    np.testing.assert_allclose(lp_weights.sum(axis=0), [1, 2, 1, 2, 7], atol=1e-6)
+    np.testing.assert_allclose(
+        lp_weights.sum(axis=0) @ all_incidence,
+        weights.sum(axis=0) @ all_incidence,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the LP optimum of this case is a fractional vertex (x = 0.5 for "
+    "rows 1 and 4 in zones 0 and 1); smart_round rounds each zone on its own "
+    "and moves one unit from row 1 to row 4, so the rounded weights lose the "
+    "conservation the LP solution has",
+)
+def test_controlled_rounding_keeps_parent_weight_at_a_fractional_vertex():
+    weights, all_incidence, controls, solved = _conservation_case()
+    problem, resid_out, status, stats, _ = solved
+    rounded = _rounded(weights, resid_out, controls)
+    np.testing.assert_array_equal(rounded.sum(axis=1), controls)
+    np.testing.assert_array_equal(rounded.sum(axis=0), [1, 2, 1, 2, 7])
+    np.testing.assert_allclose(
+        rounded.sum(axis=0) @ all_incidence,
+        weights.sum(axis=0) @ all_incidence,
+        atol=1e-9,
+    )
+
+
+def test_controlled_prefers_the_cell_with_the_larger_fraction():
+    # one unit of c1 to place, F = [0.7, 0.3]; row 1 carries only the
+    # household total. The keys favour the wrong zone at the clip limit, so
+    # the cell distance at the penalty floor (q = 100) must outrank them.
+    incidence = [[1, 1], [1, 0]]
+    weights = [[0.7, 0.3], [0.3, 0.7]]
+    controls = [1, 1]
+    keys = [[0.0, cr.KEY_CLIP], [cr.KEY_CLIP, 0.0]]
+
+    problem, resid_out, status, stats, _ = _controlled(
+        weights, incidence, controls, importance=[1e9, 100.0], keys=keys
+    )
+    assert status in STATUS_SUCCESS
+    rounded = _rounded(weights, resid_out, controls)
+    np.testing.assert_array_equal(rounded[:, 0], [1, 0])
+    np.testing.assert_array_equal(rounded[:, 1], [0, 1])
+
+
+def test_controlled_records_household_count_mismatch():
+    # the zones hold 2 + 2 households, their controls allow 2 + 1: one
+    # household of the parent cannot be kept
+    incidence = [[1, 1], [1, 0], [1, 0]]
+    weights = [[0.5, 0.5, 1.0], [0.5, 0.5, 1.0]]
+    controls = [2, 1]
+
+    problem, resid_out, status, stats, _ = _controlled(weights, incidence, controls)
+    assert status in STATUS_SUCCESS
+    np.testing.assert_array_equal(problem.hh_count, [1, 0])
+    assert problem.hh_excess == 0
+    assert problem.hh_unreachable == 0
+    assert stats["slack_conserve"] == pytest.approx(1.0, abs=1e-6)
+    np.testing.assert_allclose(resid_out.sum(axis=1), problem.hh_count, atol=1e-6)
+    rounded = _rounded(weights, resid_out, controls)
+    np.testing.assert_array_equal(rounded.sum(axis=1), controls)
+
+
+def test_controlled_without_parent_controls():
+    incidence = [[1, 1, 0], [1, 0, 1], [1, 1, 1]]
+    weights = np.array([[0.5, 0.2, 0.3], [0.4, 0.4, 1.2], [1.1, 0.4, 0.5]]).T
+    controls = [2, 1, 2]
+
+    problem, resid_out, status, stats, timing = _controlled(
+        weights, incidence, controls, keys=_log_keys(weights)
+    )
+    assert problem.parent_target.shape == (0,)
+    assert status in STATUS_SUCCESS
+    assert stats["slack_parent"] == 0.0
+    assert stats["slack_conserve"] == pytest.approx(0.0, abs=1e-6)
+    assert set(timing) == {"build_s", "solve_s"}
+    rounded = _rounded(weights, resid_out, controls)
+    np.testing.assert_array_equal(rounded.sum(axis=1), controls)
+    np.testing.assert_array_equal(rounded.sum(axis=0), [1, 2, 2])
+
+
+def test_controlled_single_zone_with_integer_weights(monkeypatch):
+    from ortools.linear_solver import pywraplp
+
+    def no_solver(*args, **kwargs):
+        raise AssertionError("the solver must not be built without variables")
+
+    monkeypatch.setattr(pywraplp, "Solver", no_solver)
+    weights = [[2.0, 1.0, 3.0]]
+    controls = [6]
+
+    problem, resid_out, status, stats, timing = _controlled(
+        weights, [[1, 1], [1, 0], [1, 1]], controls
+    )
+    assert status == STATUS_OPTIMAL
+    np.testing.assert_array_equal(resid_out, np.zeros((1, 3)))
+    assert stats == {
+        "x_count": 0,
+        "fractional_x": 0,
+        "slack_cell": 0.0,
+        "slack_parent_sub": 0.0,
+        "slack_parent": 0.0,
+        "slack_conserve": 0.0,
+    }
+    rounded = _rounded(weights, resid_out, controls)
+    np.testing.assert_array_equal(rounded, [[2, 1, 3]])
