@@ -10,6 +10,7 @@ import numpy as np
 
 from populationsim.core import inject, pipeline, config
 from populationsim.core.assign import assign_variable
+from populationsim.integerizing import bs_options
 from populationsim.core.helper import control_table_name, get_control_data_table
 
 logger = logging.getLogger(__name__)
@@ -267,7 +268,26 @@ def build_grouped_incidence_table(incidence_table, control_spec, seed_geography)
     group_incidence_table = group_incidence_table.reset_index()
 
     # Enforce int64 to join large tables
-    group_incidence_table = group_incidence_table.astype(np.int64)
+    if bs_options.keep_fractional_sample_weights():
+        # Fork option: the summed survey weight stays fractional. The int64 cast
+        # would set every group with 0 < weight < 1 to 0, and such a group could
+        # never be chosen. All other columns are cast as upstream does.
+        column_order = list(group_incidence_table.columns)
+        fractional_weights = group_incidence_table["sample_weight"].astype(np.float64)
+        group_incidence_table = group_incidence_table.drop(columns="sample_weight")
+        group_incidence_table = group_incidence_table.astype(np.int64)
+        group_incidence_table["sample_weight"] = fractional_weights
+        group_incidence_table = group_incidence_table[column_order]
+        rescued = int(
+            ((fractional_weights > 0) & (fractional_weights < 1)).sum()
+        )
+        logger.info(
+            "fractional sample weights kept: %s groups, %s with 0 < weight < 1 "
+            "(the int64 cast would set them to 0)"
+            % (len(group_incidence_table.index), rescued)
+        )
+    else:
+        group_incidence_table = group_incidence_table.astype(np.int64)
 
     logger.info(
         "grouped incidence table has %s entries, ungrouped has %s"
