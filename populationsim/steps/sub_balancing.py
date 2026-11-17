@@ -12,14 +12,33 @@ from populationsim.integerizing import (
     do_sequential_integerizing,
 )
 from populationsim.core import inject, config
+from populationsim.core import positive_weight_rows
+from populationsim.core.bs_run_options import store_positive_weight_rows_only
 from populationsim.core.helper import (
     get_control_table,
     weight_table_name,
     get_weight_table,
 )
 
-
 logger = logging.getLogger(__name__)
+
+
+def _rebuilt_parent_weights(
+    weights_df, parent_geography, parent_id, household_id_col, column, order
+):
+    """Fork: full-length parent weights from a positive-row parent table.
+
+    Used with ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` when the parent is a
+    sub-geography (its table holds only positive rows). ``order`` is the seed
+    incidence index of the parent's seed zone: the row order the dense table has
+    for every parent (the seed weight table is built in incidence order, and each
+    sub level copies its parent vector's order); see
+    :func:`populationsim.core.positive_weight_rows.rebuild_parent_weights`.
+    """
+    parent_rows = weights_df[weights_df[parent_geography] == parent_id]
+    return positive_weight_rows.rebuild_parent_weights(
+        parent_rows, household_id_col, column, order
+    )
 
 
 def balance_and_integerize(
@@ -164,7 +183,17 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
     Returns
     -------
 
+    Fork: with ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` the weight table (and the
+    ``trace_<geography>_weights`` table) holds only the rows with a positive
+    balanced or integer weight, one INFO line reports the kept share, and a parent
+    table of a sub-geography is read back to full length with zeros. The
+    ``_sparse`` table is unchanged (see
+    :mod:`populationsim.core.positive_weight_rows`).
     """
+
+    positive_only = store_positive_weight_rows_only()
+    if positive_only:
+        positive_weight_rows.reset_row_tally()
 
     NO_INTEGERIZATION_EVER = config.setting("NO_INTEGERIZATION_EVER", False)
     SUB_BALANCE_WITH_FLOAT_SEED_WEIGHTS = config.setting(
@@ -226,17 +255,31 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
                 f"{parent_geography} {parent_id}"
             )
 
-            initial_weights = weights_df[weights_df[parent_geography] == parent_id]
-            initial_weights = initial_weights.set_index(
-                settings.get("household_id_col")
-            )
-
-            # using balanced_weight slows down simul and doesn't improve results
-            # (float seeds means no zero-weight households to drop)
-            if NO_INTEGERIZATION_EVER or SUB_BALANCE_WITH_FLOAT_SEED_WEIGHTS:
-                initial_weights = initial_weights["balanced_weight"]
+            if positive_only and parent_geography != seed_geography:
+                initial_weights = _rebuilt_parent_weights(
+                    weights_df,
+                    parent_geography,
+                    parent_id,
+                    settings.get("household_id_col"),
+                    (
+                        "balanced_weight"
+                        if NO_INTEGERIZATION_EVER or SUB_BALANCE_WITH_FLOAT_SEED_WEIGHTS
+                        else "integer_weight"
+                    ),
+                    seed_incidence_df.index,
+                )
             else:
-                initial_weights = initial_weights["integer_weight"]
+                initial_weights = weights_df[weights_df[parent_geography] == parent_id]
+                initial_weights = initial_weights.set_index(
+                    settings.get("household_id_col")
+                )
+
+                # using balanced_weight slows down simul and doesn't improve results
+                # (float seeds means no zero-weight households to drop)
+                if NO_INTEGERIZATION_EVER or SUB_BALANCE_WITH_FLOAT_SEED_WEIGHTS:
+                    initial_weights = initial_weights["balanced_weight"]
+                else:
+                    initial_weights = initial_weights["integer_weight"]
 
             assert len(initial_weights.index) == len(
                 seed_incidence_df.index
@@ -265,7 +308,11 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
 
             integer_weights_list.append(zone_weights_df)
 
-    integer_weights_df = pd.concat(integer_weights_list)
+    if positive_only:
+        integer_weights_df = positive_weight_rows.concat_kept(integer_weights_list)
+        positive_weight_rows.log_row_tally(geography)
+    else:
+        integer_weights_df = pd.concat(integer_weights_list)
 
     logger.info(f"adding table {weight_table_name(geography)}")
     inject.add_table(weight_table_name(geography), integer_weights_df)

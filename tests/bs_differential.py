@@ -94,11 +94,17 @@ def export_tag(tag: str, dest: Path) -> Path:
 
 
 def run_example(
-    code_root: Path, out_dir: Path, settings_overrides: dict | None = None
+    code_root: Path,
+    out_dir: Path,
+    settings_overrides: dict | None = None,
+    allow_empty: bool = False,
 ) -> pd.DataFrame:
     """Run examples/example_test with ``populationsim`` taken from ``code_root``.
 
-    Returns the expanded household ids table written by the run.
+    Returns the expanded household ids table written by the run. With
+    ``allow_empty`` an empty table (``NO_INTEGERIZATION_EVER`` skips the
+    expansion) is returned as an empty frame instead of raising. The run's
+    checkpoint store stays in ``out_dir / "pipeline.h5"``.
     """
     code_root = Path(code_root).resolve()
     out_dir = Path(out_dir).resolve()
@@ -133,4 +139,7 @@ def run_example(
             f"example run failed (rc={proc.returncode}) for code_root={code_root}\n"
             f"stdout tail: {proc.stdout[-1500:]}\nstderr tail: {proc.stderr[-3000:]}"
         )
-    return pd.read_csv(out_dir / "bs_expanded_household_ids.csv")
+    ids_path = out_dir / "bs_expanded_household_ids.csv"
+    if allow_empty and not ids_path.read_text().strip():
+        return pd.DataFrame()
+    return pd.read_csv(ids_path)

@@ -8,11 +8,55 @@ import numpy as np
 
 from populationsim.core import inject, config
 
+from populationsim.core.bs_run_options import store_positive_weight_rows_only
 from populationsim.core.helper import get_control_table, get_weight_table
 
 logger = logging.getLogger(__name__)
 
 AS_CSV = False
+
+
+def _zero_filled_by_household(hh_weights, households):
+    """Fork: one row per household of ``households``, zero where none was stored.
+
+    With ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` a household whose weights are all
+    zero has no row in a sub-geography weight table.
+    """
+    return hh_weights.reindex(households, fill_value=0)
+
+
+def _zero_filled_aggregate(aggregate, incidence_df, seed_geography, hh_id_col):
+    """Fork: the seed-level aggregate with one row per seed household.
+
+    ``aggregate`` is ``weights_df.groupby([seed, hh], as_index=False).sum()`` of a
+    positive-row table; the result has the dense path's layout (sorted by seed
+    zone and household, zeros where no row was stored).
+    """
+    keys = pd.DataFrame(
+        {
+            seed_geography: incidence_df[seed_geography].to_numpy(),
+            hh_id_col: incidence_df.index.to_numpy(),
+        }
+    ).sort_values([seed_geography, hh_id_col])
+    full = pd.MultiIndex.from_frame(keys)
+    return (
+        aggregate.set_index([seed_geography, hh_id_col])
+        .reindex(full, fill_value=0)
+        .reset_index()
+    )
+
+
+def _zero_filled_zones(summary_df, zone_ids):
+    """Fork: one summary row per zone id (sorted, as ``groupby`` gives them).
+
+    With ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` a zone whose weights are all zero
+    has no row to group.
+    """
+    full = pd.Index(
+        np.sort(np.asarray(zone_ids)).astype(summary_df.index.dtype),
+        name=summary_df.index.name,
+    )
+    return summary_df.reindex(full, fill_value=0.0)
 
 
 def out_table(table_name, df):
@@ -73,6 +117,8 @@ def summarize_geography(
         .groupby(geography)
         .sum()
     )
+    if store_positive_weight_rows_only():
+        summary_df = _zero_filled_zones(summary_df, zone_ids)
 
     controls_df = pd.DataFrame(
         data=np.asanyarray(controls),
@@ -154,6 +200,8 @@ def meta_summary(
         sub_weights = (
             sub_weights[[hh_id_col] + sub_weight_cols].groupby(hh_id_col).sum()
         )
+        if store_positive_weight_rows_only():
+            sub_weights = _zero_filled_by_household(sub_weights, incidence.index)
 
         for c in sub_weight_cols:
             summary["%s_%s" % (g, c)] = incidence.multiply(
@@ -168,6 +216,13 @@ def summarize(crosswalk, incidence_table, control_spec):
     """
     Write aggregate summary files of controls and weights for all geographic levels to output dir
 
+    Fork: with ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` the sub-geography weight tables
+    hold only their positive rows; the step fills the missing households and zones
+    with zeros where it needs one row per group. The sums may then differ from a
+    run with the setting off in the last bits, because the zero terms are no longer
+    added (and a household of a seed zone that has no row in the dense table either
+    gets a zero instead of a missing value).
+
     Parameters
     ----------
     crosswalk : pipeline table
@@ -180,6 +235,7 @@ def summarize(crosswalk, incidence_table, control_spec):
     """
 
     include_integer_colums = not config.setting("NO_INTEGERIZATION_EVER", False)
+    positive_only = store_positive_weight_rows_only()
 
     crosswalk_df = crosswalk.to_frame()
     incidence_df = incidence_table.to_frame()
@@ -234,6 +290,8 @@ def summarize(crosswalk, incidence_table, control_spec):
             hh_weight_cols = [hh_id_col, "balanced_weight"]
 
         hh_weights = weights_df[hh_weight_cols].groupby([hh_id_col]).sum()
+        if positive_only:
+            hh_weights = _zero_filled_by_household(hh_weights, incidence_df.index)
         hh_weights_summary["%s_balanced_weight" % geography] = hh_weights[
             "balanced_weight"
         ]
@@ -246,6 +304,10 @@ def summarize(crosswalk, incidence_table, control_spec):
         aggegrate_weights = weights_df.groupby(
             [seed_geography, hh_id_col], as_index=False
         ).sum()
+        if positive_only:
+            aggegrate_weights = _zero_filled_aggregate(
+                aggegrate_weights, incidence_df, seed_geography, hh_id_col
+            )
         aggegrate_weights.set_index(hh_id_col, inplace=True)
 
         if include_integer_colums:

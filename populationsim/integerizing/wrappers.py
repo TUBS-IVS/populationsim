@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 
 from populationsim.core import config
+from populationsim.core import positive_weight_rows
+from populationsim.core.bs_run_options import store_positive_weight_rows_only
 from populationsim.integerizing.single_integerizer import Integerizer
 from populationsim.integerizing.simul_integerizer import SimulIntegerizer
 from populationsim.integerizing import path_record
@@ -12,6 +14,29 @@ logger = logging.getLogger(__name__)
 STATUS_OPTIMAL = "OPTIMAL"
 STATUS_FEASIBLE = "FEASIBLE"
 STATUS_SUCCESS = [STATUS_OPTIMAL, STATUS_FEASIBLE]
+
+
+def _stored_zone_frame(zone_weights_df, zone_id, positive_only):
+    """Fork: the zone frame as it is stored.
+
+    With ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` only its positive rows
+    (:func:`populationsim.core.positive_weight_rows.keep_positive_rows`);
+    otherwise the frame itself, as upstream.
+    """
+    if positive_only:
+        return positive_weight_rows.keep_positive_rows(zone_weights_df, zone_id)
+    return zone_weights_df
+
+
+def _concat_zone_frames(frames, positive_only):
+    """Fork: concatenate zone frames; ``pd.concat(frames)`` as upstream when off.
+
+    With ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` empty zone frames are left out, and an
+    all-empty list keeps the columns and dtypes of its first frame.
+    """
+    if positive_only:
+        return positive_weight_rows.concat_kept(frames)
+    return pd.concat(frames)
 
 
 def try_simul_integerizing(
@@ -117,6 +142,8 @@ def reshape_result(
         plus columns for household id, and sub_geography zone ids
     """
 
+    positive_only = store_positive_weight_rows_only()
+
     # integerize the sub_zone weights
     integer_weights_list = []
     for zone_id, zone_name in list(sub_control_zones.items()):
@@ -133,9 +160,11 @@ def reshape_result(
             integerized_weights[zone_name].astype(int).values
         )
 
-        integer_weights_list.append(zone_weights_df)
+        integer_weights_list.append(
+            _stored_zone_frame(zone_weights_df, zone_id, positive_only)
+        )
 
-    integer_weights_df = pd.concat(integer_weights_list)
+    integer_weights_df = _concat_zone_frames(integer_weights_list, positive_only)
 
     return integer_weights_df
 
@@ -576,6 +605,7 @@ def do_sequential_integerizing(
     plus columns for household id, and sub_geography zone ids
 
     """
+    positive_only = store_positive_weight_rows_only()
     integerized_weights_list = []
     rounded_weights_list = []
     integerized_zone_ids = []
@@ -605,6 +635,7 @@ def do_sequential_integerizing(
         zone_weights_df[sub_geography] = zone_id
         zone_weights_df["balanced_weight"] = weights.values
         zone_weights_df["integer_weight"] = integer_weights.astype(int).values
+        zone_weights_df = _stored_zone_frame(zone_weights_df, zone_id, positive_only)
 
         if status in STATUS_SUCCESS:
             integerized_weights_list.append(zone_weights_df)
@@ -614,15 +645,21 @@ def do_sequential_integerizing(
             rounded_zone_ids.append(zone_id)
 
     if combine_results:
-        integerized_weights_df = pd.concat(
-            integerized_weights_list + rounded_weights_list
+        integerized_weights_df = _concat_zone_frames(
+            integerized_weights_list + rounded_weights_list, positive_only
         )
         return integerized_weights_df
 
     integerized_weights_df = (
-        pd.concat(integerized_weights_list) if integerized_zone_ids else None
+        _concat_zone_frames(integerized_weights_list, positive_only)
+        if integerized_zone_ids
+        else None
     )
-    rounded_weights_df = pd.concat(rounded_weights_list) if rounded_zone_ids else None
+    rounded_weights_df = (
+        _concat_zone_frames(rounded_weights_list, positive_only)
+        if rounded_zone_ids
+        else None
+    )
 
     return (
         integerized_zone_ids,
@@ -650,6 +687,7 @@ def do_no_integerizing(sub_weights, sub_control_zones, sub_geography, **kwargs):
         canonical form weight table, with columns for 'balanced_weight', 'integer_weight'
         plus columns for household id, and sub_geography zone ids
     """
+    positive_only = store_positive_weight_rows_only()
     integerized_weights_list = []
     rounded_weights_list = []
     integerized_zone_ids = []
@@ -667,8 +705,12 @@ def do_no_integerizing(sub_weights, sub_control_zones, sub_geography, **kwargs):
         zone_weights_df[sub_geography] = zone_id
         zone_weights_df["balanced_weight"] = weights.values
 
-        integerized_weights_list.append(zone_weights_df)
+        integerized_weights_list.append(
+            _stored_zone_frame(zone_weights_df, zone_id, positive_only)
+        )
         integerized_zone_ids.append(zone_id)
 
-    integerized_weights_df = pd.concat(integerized_weights_list + rounded_weights_list)
+    integerized_weights_df = _concat_zone_frames(
+        integerized_weights_list + rounded_weights_list, positive_only
+    )
     return integerized_weights_df
