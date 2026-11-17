@@ -114,3 +114,61 @@ def test_options_logged_once(settings, caplog):
     assert "do_simul_integerizing" not in msg
     for token in ("timeout", "draw", "seed", "fractional", "path_record"):
         assert token in msg
+
+
+def test_rounding_mode_defaults_to_round(settings):
+    assert bs_options.rounding_mode() == "round"
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    assert bs_options.rounding_mode() == "controlled"
+
+
+@pytest.mark.parametrize("bad", ["Controlled", "yes", True, 1])
+def test_rounding_mode_rejects_unknown_value(settings, bad):
+    settings["INTEGERIZER_ROUNDING"] = bad
+    with pytest.raises(ValueError, match="INTEGERIZER_ROUNDING"):
+        bs_options.rounding_mode()
+
+
+def test_controlled_rounding_rejects_cvxpy(settings):
+    assert bs_options.resolve_rounding_mode(True) == "round"
+    assert bs_options.resolve_rounding_mode(False) == "round"
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    assert bs_options.resolve_rounding_mode(False) == "controlled"
+    with pytest.raises(ValueError, match="INTEGERIZER_ROUNDING"):
+        bs_options.resolve_rounding_mode(True)
+
+
+def test_penalty_settings_defaults(settings):
+    got = bs_options.penalty_settings()
+    assert isinstance(got, bs_options.PenaltySettings)
+    assert tuple(got) == (100.0, 100000.0, 10.0, 100000.0)
+    settings["INTEGERIZER_PENALTY_FLOOR"] = 50
+    assert bs_options.penalty_settings().floor == 50.0
+
+
+@pytest.mark.parametrize(
+    "key,bad",
+    [
+        ("INTEGERIZER_PENALTY_FLOOR", 0),
+        ("INTEGERIZER_PENALTY_CAP", 50),
+        ("INTEGERIZER_PARENT_TOTAL_FACTOR", 0.5),
+        ("INTEGERIZER_CONSERVE_PENALTY", -1),
+        ("INTEGERIZER_PENALTY_FLOOR", float("nan")),
+        ("INTEGERIZER_PENALTY_CAP", float("inf")),
+        ("INTEGERIZER_CONSERVE_PENALTY", True),
+        ("INTEGERIZER_PARENT_TOTAL_FACTOR", "10"),
+    ],
+)
+def test_penalty_settings_reject_invalid(settings, key, bad):
+    settings[key] = bad
+    with pytest.raises(ValueError, match=key):
+        bs_options.penalty_settings()
+
+
+def test_options_log_controlled_values(settings, caplog):
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
+        bs_options.log_options_once()
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "rounding=controlled" in msg
+    assert "100000.0" in msg and "penalty_floor" in msg

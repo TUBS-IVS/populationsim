@@ -5,7 +5,11 @@
 Every setting defaults to the behaviour of upstream v0.10.0.
 """
 
+from __future__ import annotations
+
 import logging
+import math
+from typing import NamedTuple
 
 import numpy as np
 
@@ -19,6 +23,11 @@ TIMEOUT_ALIAS = "INTEGIZER_TIMEOUT"  # upstream's historical misspelling
 DEFAULT_TIMEOUT_SECONDS = 60
 DRAW_METHODS = ("off", "pareto", "gumbel")
 CALL_KINDS = ("single", "simul")
+ROUNDING_MODES = ("round", "controlled")
+CVXPY_ROUNDING_MESSAGE = (
+    "INTEGERIZER_ROUNDING=controlled requires the OR-Tools integerizer "
+    "(USE_CVXPY false)"
+)
 
 _logged = False
 
@@ -66,6 +75,68 @@ def random_seed():
     return int(value)
 
 
+def rounding_mode():
+    """``INTEGERIZER_ROUNDING``: ``round`` (default, upstream) or ``controlled``."""
+    value = config.setting("INTEGERIZER_ROUNDING", "round")
+    if not isinstance(value, str) or value not in ROUNDING_MODES:
+        raise ValueError(
+            f"INTEGERIZER_ROUNDING must be one of {ROUNDING_MODES}, got {value!r}"
+        )
+    return value
+
+
+def resolve_rounding_mode(use_cvxpy):
+    """``INTEGERIZER_ROUNDING`` for an integerizer, refused for the CVXPY solver."""
+    mode = rounding_mode()
+    if mode == "controlled" and use_cvxpy:
+        raise ValueError(CVXPY_ROUNDING_MESSAGE)
+    return mode
+
+
+class PenaltySettings(NamedTuple):
+    """Penalty tiers of the controlled rounding (see the fair-rounding design)."""
+
+    floor: float
+    cap: float
+    parent_total_factor: float
+    conserve_penalty: float
+
+
+def _number(key, default):
+    value = config.setting(key, default)
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{key} must be a finite number, got {value!r}")
+    return float(value)
+
+
+def penalty_settings():
+    """Penalty tiers: floor > 0, cap >= floor, factor >= 1, conserve >= 0."""
+    floor = _number("INTEGERIZER_PENALTY_FLOOR", 100.0)
+    cap = _number("INTEGERIZER_PENALTY_CAP", 100000.0)
+    factor = _number("INTEGERIZER_PARENT_TOTAL_FACTOR", 10.0)
+    conserve = _number("INTEGERIZER_CONSERVE_PENALTY", 100000.0)
+    if floor <= 0:
+        raise ValueError(f"INTEGERIZER_PENALTY_FLOOR must be > 0, got {floor!r}")
+    if cap < floor:
+        raise ValueError(
+            f"INTEGERIZER_PENALTY_CAP must be >= INTEGERIZER_PENALTY_FLOOR "
+            f"({floor!r}), got {cap!r}"
+        )
+    if factor < 1:
+        raise ValueError(
+            f"INTEGERIZER_PARENT_TOTAL_FACTOR must be >= 1, got {factor!r}"
+        )
+    if conserve < 0:
+        raise ValueError(
+            f"INTEGERIZER_CONSERVE_PENALTY must be >= 0, got {conserve!r}"
+        )
+    return PenaltySettings(floor, cap, factor, conserve)
+
+
 def _flag(key):
     value = config.setting(key, False)
     if not isinstance(value, (bool, np.bool_)):
@@ -100,15 +171,26 @@ def log_options_once():
     if _logged:
         return
     _logged = True
-    logger.info(
+    mode = rounding_mode()
+    message = (
         "integerizer options: timeout=%ss draw=%s seed=%s "
-        "keep_fractional_sample_weights=%s path_record=%s",
+        "keep_fractional_sample_weights=%s path_record=%s rounding=%s"
+    )
+    args = [
         integerizer_timeout_seconds(),
         draw_method(),
         random_seed(),
         keep_fractional_sample_weights(),
         path_record_enabled(),
-    )
+        mode,
+    ]
+    if mode == "controlled":
+        message += (
+            " penalty_floor=%s penalty_cap=%s parent_total_factor=%s "
+            "conserve_penalty=%s"
+        )
+        args.extend(penalty_settings())
+    logger.info(message, *args)
 
 
 def reset_for_tests():
