@@ -6,10 +6,17 @@ import logging
 import numpy as np
 import pandas as pd
 
-from populationsim.core import config
+from populationsim.core import bs_run_options, config
 from populationsim.integerizing.constants import STATUS_OPTIMAL
 from populationsim.integerizing.smart_round import smart_round
-from populationsim.integerizing import bs_options, draw, lp_cvx, lp_ortools, path_record
+from populationsim.integerizing import (
+    bs_options,
+    draw,
+    lp_cvx,
+    lp_ortools,
+    lp_single_fast,
+    path_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,10 @@ class Integerizer:
         use_cvxpy = config.setting("USE_CVXPY", False)
         if use_cvxpy:
             self.integerizer_func = lp_cvx.np_integerizer_cvx
+        elif bs_run_options.fast_paths():
+            # fork: FAST_PATHS builds the same OR-Tools model from the non-zero
+            # coefficients only (see lp_single_fast)
+            self.integerizer_func = lp_single_fast.np_integerizer_ortools_fast
         else:
             self.integerizer_func = lp_ortools.np_integerizer_ortools
 

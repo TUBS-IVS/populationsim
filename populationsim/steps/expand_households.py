@@ -6,10 +6,69 @@ import logging
 import pandas as pd
 import numpy as np
 
-from populationsim.core import pipeline, inject, config
+from populationsim.core import bs_run_options, pipeline, inject, config
 from populationsim.core.helper import get_weight_table
 
 logger = logging.getLogger(__name__)
+
+
+def household_lists_for_groups(household_groups, group_ids, household_id_col):
+    """Household ids and draw probabilities of the groups in ``group_ids``.
+
+    Fork fast path of ``expand_households`` (setting ``FAST_PATHS``). Upstream
+    builds ``[hh_ids, probs]`` for every incidence group by iterating a
+    ``groupby`` over the whole ``household_groups`` table, although the expanded
+    weights of a run use only a small share of the groups. This builds the same
+    two lists for the used groups only and returns them in a dict keyed by group
+    id, which the step's chooser indexes exactly as upstream's list.
+
+    The lists are equal element for element and in type to upstream's: the rows
+    of a group keep their order in ``household_groups`` (a stable sort by group
+    id, as ``groupby`` keeps it), and each list is made by the same pandas
+    expressions on a Series of the same dtype and values
+    (``list(ids)``, ``list(w / w.sum())``), so the sum and the division are the
+    same operations. Building the lists draws no random number; upstream's loop
+    does not either, so skipping the unused groups leaves the draws unchanged.
+
+    Parameters
+    ----------
+    household_groups : pandas.DataFrame
+        columns ``household_id_col``, ``group_id``, ``sample_weight``
+    group_ids : array-like
+        group ids that occur in the expanded weights (any order, repeats allowed)
+    household_id_col : str
+
+    Returns
+    -------
+    dict
+        ``{group_id: [hh_ids, probs]}`` for every group id in ``group_ids``
+    """
+    group_col = household_groups["group_id"].to_numpy()
+    used = pd.unique(np.asarray(group_ids))
+    rows = np.flatnonzero(np.isin(group_col, used))
+    order = rows[np.argsort(group_col[rows], kind="stable")]
+    sorted_groups = group_col[order]
+    ids = household_groups[household_id_col].iloc[order].reset_index(drop=True)
+    weights = household_groups["sample_weight"].iloc[order].reset_index(drop=True)
+
+    lists = {}
+    if len(order):
+        starts = np.flatnonzero(
+            np.concatenate([[True], sorted_groups[1:] != sorted_groups[:-1]])
+        )
+        ends = np.concatenate([starts[1:], [len(order)]])
+        for group_id, start, end in zip(
+            sorted_groups[starts].tolist(), starts.tolist(), ends.tolist()
+        ):
+            w = weights.iloc[start:end]
+            lists[group_id] = [list(ids.iloc[start:end]), list(w / w.sum())]
+
+    logger.info(
+        "expand_households: household lists built for %s of %s incidence groups"
+        " (FAST_PATHS; the others are not drawn from)"
+        % (len(lists), len(pd.unique(group_col)))
+    )
+    return lists
 
 
 @inject.step()
@@ -67,12 +126,19 @@ def expand_households():
         #   [ [<group_1_hh_id_list>], [<group_1_hh_prob_list>] ], ... ]
         HH_IDS = 0
         HH_PROBS = 1
-        grouper = household_groups.groupby("group_id")
-        group_hh_probs = [0] * len(grouper)
-        for group_id, df in grouper:
-            hh_ids = list(df[household_id_col])
-            probs = list(df.sample_weight / df.sample_weight.sum())
-            group_hh_probs[group_id] = [hh_ids, probs]
+        if bs_run_options.fast_paths():
+            # fork: FAST_PATHS builds the lists only for the groups the expanded
+            # weights use, as a dict by group id; the draws below are unchanged
+            group_hh_probs = household_lists_for_groups(
+                household_groups, expanded_weights.group_id.to_numpy(), household_id_col
+            )
+        else:
+            grouper = household_groups.groupby("group_id")
+            group_hh_probs = [0] * len(grouper)
+            for group_id, df in grouper:
+                hh_ids = list(df[household_id_col])
+                probs = list(df.sample_weight / df.sample_weight.sum())
+                group_hh_probs[group_id] = [hh_ids, probs]
 
         # get a repeatable random number sequence generator for consistent choice results
         prng = pipeline.get_rn_generator().get_external_rng("expand_households")
