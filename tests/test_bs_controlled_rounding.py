@@ -55,10 +55,13 @@ def _build(*args, **kwargs):
 
 
 def test_targets_band_and_parent_totals():
-    # column 0 = household total, column 1 = a control with F = [0.3, 0.4, 0.3];
-    # row 1 carries only the household total and has integer parts
+    # column 0 = household total, column 1 = a control (e.g. persons) with
+    # incidence 2 in row 0 and 0 in row 1: F = 2 * [0.3, 0.4, 0.3]. The
+    # incidence is asymmetric, so a transposed incidence (column 0 = w0 + 2 w1)
+    # changes every total. Row 1 carries only the household total and has
+    # integer parts.
     weights = [[0.3, 2.0], [0.4, 1.25], [0.3, 0.75]]
-    incidence = [[1, 1], [1, 0]]
+    incidence = [[1, 2], [1, 0]]
     problem = _build(
         weights,
         incidence,
@@ -69,9 +72,9 @@ def test_targets_band_and_parent_totals():
 
     np.testing.assert_array_equal(problem.band_lo[:, 1], [0, 0, 0])
     np.testing.assert_array_equal(problem.band_hi[:, 1], [1, 1, 1])
-    np.testing.assert_allclose(problem.frac[:, 1], [0.3, 0.4, 0.3], atol=1e-12)
-    assert problem.parent_sub_target[1] == 1
-    assert problem.parent_target.tolist() == [1]
+    np.testing.assert_allclose(problem.frac[:, 1], [0.6, 0.8, 0.6], atol=1e-12)
+    assert problem.parent_sub_target[1] == 2  # round(2.0) - 0
+    assert problem.parent_target.tolist() == [1]  # round(1.0) - 0
     # household total: F = [2.3, 1.65, 1.05], integer part A = [2, 1, 0]
     np.testing.assert_array_equal(problem.band_lo[:, 0], [0, 0, 1])
     np.testing.assert_array_equal(problem.band_hi[:, 0], [1, 1, 2])
@@ -110,9 +113,18 @@ def test_household_count_is_what_smart_round_enforces():
     controls = [5, 2, 9]
     problem = _build(weights, [[1]] * 4, household_controls=controls)
 
+    # Integer parts [1, 1, 1, 0] sum to 3; H = 4 rows, all with a residual.
+    # need = N - 3 = [2, -1, 6]:
+    # - hh_count = clip(need, 0, n_avail = 4) = [2, 0, 4];
+    # - hh_excess = max(-need, 0) summed = 1 (zone 1 already holds 3 > 2);
+    # - smart_round adds min(max(need, 0), H) = [2, 0, 4] rows, all of them
+    #   rows with a residual, so hh_outside_lp = [2, 0, 4] - hh_count = 0;
+    # - zone 2 asks for 6 but smart_round adds at most H = 4 rows:
+    #   hh_unreachable = max(need - H, 0) summed = 2.
     np.testing.assert_array_equal(problem.hh_count, [2, 0, 4])
     assert problem.hh_count.dtype.kind == "i"
     assert problem.hh_excess == 1
+    assert problem.hh_outside_lp == 0
     assert problem.hh_unreachable == 2
 
     # the count is the number of rows smart_round rounds up
@@ -121,6 +133,94 @@ def test_household_count_is_what_smart_round_enforces():
     for z, control in enumerate(controls):
         added = smart_round(int_weights, resid, control).sum() - int_weights.sum()
         assert added == problem.hh_count[z]
+
+
+def test_household_count_counts_rows_not_household_total_incidence(caplog):
+    # row 0 has integer part 2 but household-total incidence 0: smart_round
+    # counts rows, so it needs 3 - 2 = 1 more household, not 3 - 0 = 3 (clipped
+    # to the 2 rows with a residual)
+    weights = [[2.0, 0.5, 0.5]]
+    incidence = [[0], [1], [1]]
+    with caplog.at_level("WARNING", logger=cr.__name__):
+        problem = _build(weights, incidence, household_controls=[3])
+
+    np.testing.assert_array_equal(problem.hh_count, [1])
+    assert problem.hh_excess == 0
+    assert problem.hh_outside_lp == 0
+    assert problem.hh_unreachable == 0
+    assert "household-total incidence is not 1" in caplog.text
+    int_weights = np.array(weights[0]).astype(int)
+    resid = np.array(weights[0]) - int_weights
+    added = smart_round(int_weights, resid, 3).sum() - int_weights.sum()
+    assert added == problem.hh_count[0]
+
+
+def test_household_count_split_outside_the_lp_and_unreachable():
+    # integer parts [1, 0, 0], H = 3 rows, one with a residual; N = 10.
+    # need = 10 - 1 = 9; the LP rounds up hh_count = clip(9, 0, 1) = 1 row;
+    # smart_round's shortfall is clipped at H: it adds min(9, 3) = 3 rows, the
+    # 2 beyond the LP's among the rows without a residual (hh_outside_lp = 2);
+    # the remaining 9 - 3 = 6 are never added (hh_unreachable = 6).
+    weights = [[1.5, 0.0, 0.0]]
+    problem = _build(weights, [[1]] * 3, household_controls=[10])
+
+    np.testing.assert_array_equal(problem.hh_count, [1])
+    assert problem.hh_outside_lp == 2
+    assert problem.hh_unreachable == 6
+    assert problem.hh_excess == 0
+    int_weights = np.array(weights[0]).astype(int)
+    resid = np.array(weights[0]) - int_weights
+    rounded = smart_round(int_weights, resid, 10)
+    added = rounded.sum() - int_weights.sum()
+    assert added == problem.hh_count[0] + problem.hh_outside_lp
+    assert 10 - rounded.sum() == problem.hh_unreachable
+
+
+def test_x_coefficients_match_a_brute_force_fold():
+    # 3 zones x 5 rows x 4 controls (household total in column 2), incidence
+    # in {0, 1, 2} differing per row and control, non-zero keys and a
+    # different fraction in every cell
+    rng = np.random.default_rng(646)
+    zones, rows, controls, t = 3, 5, 4, 2
+    incidence = np.array(
+        [[2, 0, 1, 1], [0, 1, 1, 2], [1, 2, 1, 0], [2, 1, 1, 1], [0, 2, 1, 2]],
+        dtype=np.float64,
+    )
+    weights = rng.uniform(0.05, 2.95, size=(zones, rows))
+    keys = rng.uniform(-25.0, 25.0, size=(zones, rows))
+    keys[0, 0] = 80.0  # clipped to KEY_CLIP
+    importance = np.array([150.0, 50.0, 1e9, 3000.0])  # 50 -> floor 100
+    problem = _build(
+        weights,
+        incidence,
+        household_controls=[4] * zones,
+        importance=importance,
+        keys=keys,
+        total_index=t,
+    )
+
+    # brute force: float cell totals, fractions and the folded cell slope
+    float_totals = np.zeros((zones, controls))
+    for z in range(zones):
+        for c in range(controls):
+            for h in range(rows):
+                float_totals[z, c] += weights[z, h] * incidence[h, c]
+    distance = np.abs(float_totals - np.round(float_totals))
+    assert distance.min() > 1e-3  # no snapping, every cell has a fraction
+    frac = float_totals - np.floor(float_totals)
+    assert len(np.unique(np.round(frac, 9))) == frac.size
+    q = np.clip(importance, PENALTIES.floor, PENALTIES.cap)
+    expected = np.zeros((zones, rows))
+    for z in range(zones):
+        for h in range(rows):
+            value = float(np.clip(keys[z, h], -cr.KEY_CLIP, cr.KEY_CLIP))
+            for c in range(controls):
+                if c != t:
+                    value -= q[c] * (1.0 - 2.0 * frac[z, c]) * incidence[h, c]
+            expected[z, h] = value
+
+    np.testing.assert_allclose(problem.frac, frac, atol=1e-12)
+    np.testing.assert_allclose(problem.x_coef, expected, rtol=0, atol=1e-9)
 
 
 def test_penalty_tiers():
@@ -523,6 +623,7 @@ def test_controlled_records_household_count_mismatch():
     assert status in STATUS_SUCCESS
     np.testing.assert_array_equal(problem.hh_count, [1, 0])
     assert problem.hh_excess == 0
+    assert problem.hh_outside_lp == 0
     assert problem.hh_unreachable == 0
     assert stats["slack_conserve"] == pytest.approx(1.0, abs=1e-6)
     np.testing.assert_allclose(resid_out.sum(axis=1), problem.hh_count, atol=1e-6)

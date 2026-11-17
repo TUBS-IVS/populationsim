@@ -19,9 +19,10 @@ integerizer falls back to sequential integerizing. The controlled rounding
 by construction, with this order of priorities:
 
 1. hard: the number of rows rounded up in each sub-zone is the number the
-   final ``smart_round`` enforces anyway, ``k[z] = clip(N[z] - A[z, t], 0,
-   n_avail[z])`` (``N`` the integer household control, ``t`` the household
-   total column, ``n_avail`` the rows with a positive residual);
+   final ``smart_round`` enforces anyway, ``k[z] = clip(N[z] - sum_h a[z, h],
+   0, n_avail[z])`` (``N`` the integer household control, ``n_avail`` the
+   rows with a positive residual; ``smart_round`` counts rows, so the integer
+   parts are summed as rows, not weighted by the household-total incidence);
 2. conservation: each row keeps its weight summed over the sub-zones,
    ``sum_z x[z, h] = round(sum_z r[z, h])``;
 3. parent totals: of every sub control (``round(sum_z F)``) and of every
@@ -105,7 +106,8 @@ class ControlledProblem:
     x_allowed : (Z, H) bool
         a variable ``x[z, h]`` exists where the residual ``r[z, h] > 0``
     hh_count : (Z,) int
-        rows rounded up per sub-zone (hard), ``clip(N - A_t, 0, n_avail)``
+        rows rounded up per sub-zone (hard), ``clip(N - sum_h a, 0, n_avail)``
+        (``smart_round`` counts rows, not household-total incidence)
     band_lo, band_hi : (Z, C) float
         ``floor(F') - A`` and ``ceil(F') - A``, clipped at 0
     frac : (Z, C) float
@@ -132,12 +134,15 @@ class ControlledProblem:
         minus ``sum over c != t of q_c (1 - 2 frac) inc[h, c]``; only the
         entries where ``x_allowed`` enter the LP
     hh_unreachable : int
-        households the integer controls ask for beyond the rows with a
-        residual, ``sum max(N - A_t - n_avail, 0)``; ``smart_round`` adds them
-        among rows without a residual, as upstream
+        households the integer controls ask for that ``smart_round`` never
+        adds, ``sum max(N - sum_h a - H, 0)``: its shortfall is clipped at
+        the ``H`` rows of the sub-zone
+    hh_outside_lp : int
+        households ``smart_round`` adds among rows without a residual, outside
+        the LP's choice, ``sum (min(max(N - sum_h a, 0), H) - hh_count)``
     hh_excess : int
         households the integer parts already hold beyond the integer
-        controls, ``sum max(A_t - N, 0)``; no rounding can remove them
+        controls, ``sum max(sum_h a - N, 0)``; no rounding can remove them
 
     The household-total column ``t`` is present in every ``(Z, C)`` and
     ``(C,)`` array but unused by the LP: rule 1 fixes the count per sub-zone.
@@ -159,6 +164,7 @@ class ControlledProblem:
     conserve_penalty: float
     x_coef: np.ndarray
     hh_unreachable: int
+    hh_outside_lp: int
     hh_excess: int
 
 
@@ -312,22 +318,28 @@ def build_problem(
     parent_target = np.round(w.sum(axis=0) @ pinc) - a.sum(axis=0) @ pinc
     conserve_target = np.round(r.sum(axis=0))
 
-    # household count per sub-zone: what smart_round adds to the integer parts
+    # household count per sub-zone: what smart_round adds to the integer parts.
+    # smart_round counts rows: its shortfall is N - sum_h a, clipped to
+    # [0, H]; it rounds up the rows with the largest residual, so the LP picks
+    # min(shortfall, n_avail) of them and the rest fall on rows without one.
     held = w.sum(axis=0) > 0
     off_one = int((inc[held, t] != 1).sum())
     if off_one:
-        # smart_round counts rows; A[:, t] counts household-total incidence
+        # the household count follows smart_round's row count; the
+        # household-total cell (A[:, t] + x @ inc[:, t]) then differs from it
         logger.warning(
             "controlled rounding: household-total incidence is not 1 for %s of "
-            "%s rows with weight; the LP household count may differ from "
-            "smart_round's",
+            "%s rows with weight; the household-total cell differs from the "
+            "row count smart_round enforces",
             off_one,
             int(held.sum()),
         )
     n_avail = x_allowed.sum(axis=1)
-    need = n_control - int_totals[:, t]
+    need = n_control - a.sum(axis=1)
+    added = np.clip(need, 0, rows)  # rows smart_round adds per sub-zone
     hh_count = np.rint(np.clip(need, 0, n_avail)).astype(np.int64)
-    hh_unreachable = int(np.rint(np.maximum(need - n_avail, 0.0).sum()))
+    hh_outside_lp = int(np.rint((added - hh_count).sum()))
+    hh_unreachable = int(np.rint(np.maximum(need - rows, 0.0).sum()))
     hh_excess = int(np.rint(np.maximum(-need, 0.0).sum()))
 
     # objective coefficient of x (maximisation): clipped key minus the folded
@@ -353,6 +365,7 @@ def build_problem(
         conserve_penalty=float(penalties.conserve_penalty),
         x_coef=_read_only(x_coef),
         hh_unreachable=hh_unreachable,
+        hh_outside_lp=hh_outside_lp,
         hh_excess=hh_excess,
     )
 
