@@ -1,12 +1,20 @@
 # PopulationSim
 # See full license in LICENSE.txt.
-"""The ``FAST_PATHS`` numba balancer kernels are identical to the originals, bit for bit.
+"""The ``FAST_PATHS`` numba balancers give the weights of the originals, bit for bit.
 
-The fast kernels skip ``exp(log_gamma * inc)`` for a zero incidence cell
-(``w * exp(0.0) == w`` exactly). The balanced weights feed an integerizer whose
-choices can flip on a last-bit difference, so every comparison here is on the
-raw bytes (``-0.0`` against ``0.0`` would fail), never within a tolerance.
-All kernels run compiled (no ``py_func``): the claim is about the compiled code.
+The fast balancers (``np_balancer_numba_fast``, ``np_simul_balancer_numba_fast``)
+take ``exp(log_gamma * inc)`` from a per-control lookup table of the distinct
+incidence values. The balanced weights feed an integerizer whose choices can
+flip on a last-bit difference, so weights, relaxation factors, the converged
+flag and the iteration count are compared on the raw bytes, never within a
+tolerance. Only ``delta`` (the third status value) is compared with a relative
+tolerance: the fast update loop may sum ``|new_w - w_old|`` in another order,
+and the guard re-runs the original kernel whenever ``delta`` comes near a
+convergence threshold, so only the last bits of the reported number can differ.
+
+Every comparison goes through the public fast functions, so the guard and the
+fallbacks are part of what is tested. All kernels run compiled (no
+``py_func``): the claim is about the compiled code.
 """
 
 import logging
@@ -16,13 +24,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from populationsim.balancing import balancers_numba, wrappers
+from populationsim.balancing import balancers_numba, simul_balancer, wrappers
 from populationsim.balancing.balancers import np_balancer_py, np_simul_balancer_py
 from populationsim.balancing.balancers_numba import (
+    fast_path_counts,
     np_balancer_numba,
     np_balancer_numba_fast,
     np_simul_balancer_numba,
     np_simul_balancer_numba_fast,
+    reset_fast_path_counts,
 )
 from populationsim.balancing.single_balancer import ListBalancer
 from populationsim.balancing.simul_balancer import SimultaneousListBalancer
@@ -31,6 +41,17 @@ from tests.bs_differential import REPO_ROOT, run_example
 
 # Row counts that are and are not multiples of the SIMD widths (2, 4, 8).
 EDGE_SIZES = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 63, 65, 127, 129, 5000]
+# Non-integer incidence values mixed into the float problems (1/3 is not exact
+# in float32 or float64, so the conversion to float64 matters).
+NON_INTEGER_VALUES = np.array([0.1, 0.5, 1.5, 2.25, 1.0 / 3.0])
+FAST_OUTCOMES = {"fast", "rerun_delta_band"}
+
+
+@pytest.fixture(autouse=True)
+def _clean_counts():
+    reset_fast_path_counts()
+    yield
+    reset_fast_path_counts()
 
 
 def _bytes_equal(a, b):
@@ -49,13 +70,47 @@ def _status_key(status):
     )
 
 
-def _incidence(rng, control_count, sample_count, densities):
-    """Integer counts 0..4; one density per control row (0 = all-zero row)."""
+def _assert_same_result(orig, fast):
+    w_orig, rf_orig, st_orig = orig
+    w_fast, rf_fast, st_fast = fast
+    assert _bytes_equal(w_orig, w_fast), "weights differ"
+    assert _bytes_equal(rf_orig, rf_fast), "relaxation factors differ"
+    assert bool(st_orig[0]) == bool(st_fast[0]), "converged flag differs"
+    assert int(st_orig[1]) == int(st_fast[1]), "iteration count differs"
+    # delta only decides convergence; the fast update loop may sum it in
+    # another order (relative difference about n * 2.2e-16), and the guard
+    # re-runs the original kernel whenever it is within 1e-6 relative of a
+    # threshold. So the decisions above are identical, the number may differ
+    # in its last bits.
+    assert float(st_fast[2]) == pytest.approx(float(st_orig[2]), rel=1e-9, abs=0.0)
+    # max_gamma_dif is derived from the identical gammas
+    assert struct.pack("<d", float(st_orig[3])) == struct.pack("<d", float(st_fast[3]))
+
+
+def _only_outcome(kind):
+    counts = fast_path_counts()[kind]
+    used = {outcome: n for outcome, n in counts.items() if n}
+    assert sum(used.values()) == 1, counts
+    return next(iter(used))
+
+
+def _incidence(rng, control_count, sample_count, densities, non_integer=False):
+    """Integer counts 0..6, one density per control row (0 = all-zero row).
+
+    With ``non_integer``, about 3 % of the non-zero cells get a value from
+    NON_INTEGER_VALUES (float64 result).
+    """
     rows = []
     for density in densities:
         present = rng.random(sample_count) < density
-        rows.append(present * rng.integers(1, 5, size=sample_count))
-    return np.array(rows, dtype=np.int64).reshape(control_count, sample_count)
+        rows.append(present * rng.integers(1, 7, size=sample_count))
+    incidence = np.array(rows, dtype=np.int64).reshape(control_count, sample_count)
+    if not non_integer:
+        return incidence
+    incidence = incidence.astype(np.float64)
+    odd = (incidence > 0) & (rng.random(incidence.shape) < 0.03)
+    incidence[odd] = rng.choice(NON_INTEGER_VALUES, size=int(odd.sum()))
+    return incidence
 
 
 def _densities(rng, control_count):
@@ -88,8 +143,13 @@ def _single_problem(seed, sample_count=None):
     if sample_count is None:
         sample_count = int(np.exp(rng.uniform(0.0, np.log(5000.0))))
     control_count = int(rng.integers(1, 31))
+    variant = seed % 6
     incidence = _incidence(
-        rng, control_count, sample_count, _densities(rng, control_count)
+        rng,
+        control_count,
+        sample_count,
+        _densities(rng, control_count),
+        non_integer=variant >= 2,
     )
     master = -1
     if rng.random() < 0.7:
@@ -106,12 +166,9 @@ def _single_problem(seed, sample_count=None):
     # The callers pass incidence_table.values.T, which is C-contiguous for a
     # pandas frame (its block is stored transposed) and int64 or float64 with
     # NUMBA_PRECISION float64; both layouts are tested.
-    variant = seed % 6
     fortran = variant % 2 == 1
     inc = np.ascontiguousarray(incidence.T).T if fortran else incidence
-    if variant in (2, 3):
-        inc = inc.astype(np.float64)
-    elif variant in (4, 5):
+    if variant in (4, 5):
         # NUMBA_PRECISION float32: every array is cast to float32 by the caller
         inc = inc.astype(np.float32)
         w, lb, ub = (a.astype(np.float32) for a in (w, lb, ub))
@@ -138,7 +195,11 @@ def _simul_problem(seed, sample_count=None):
     control_count = int(rng.integers(1, 31))
     zone_count = int(rng.integers(1, 13))
     incidence = _incidence(
-        rng, control_count, sample_count, _densities(rng, control_count)
+        rng,
+        control_count,
+        sample_count,
+        _densities(rng, control_count),
+        non_integer=seed % 3 == 0,
     )
     master = int(rng.integers(0, control_count))
     incidence[master, :] = 1
@@ -194,38 +255,42 @@ def _copy_args(args):
     return tuple(a.copy(order="K") if isinstance(a, np.ndarray) else a for a in args)
 
 
-SINGLE_CASES = [(seed, None) for seed in range(48)] + [
+SINGLE_CASES = [(seed, None) for seed in range(66)] + [
     (1000 + i, n) for i, n in enumerate(EDGE_SIZES)
 ]
-SIMUL_CASES = [(seed, None) for seed in range(44)] + [
+SIMUL_CASES = [(seed, None) for seed in range(62)] + [
     (2000 + i, n) for i, n in enumerate(EDGE_SIZES)
 ]
 
 
 @pytest.mark.parametrize("seed, sample_count", SINGLE_CASES)
-def test_single_fast_kernel_is_bitwise_identical(seed, sample_count):
+def test_single_fast_balancer_gives_identical_weights(seed, sample_count):
     args = _single_problem(seed, sample_count)
-    w_orig, rf_orig, st_orig = np_balancer_numba(*_copy_args(args))
-    w_fast, rf_fast, st_fast = np_balancer_numba_fast(*_copy_args(args))
-    assert _bytes_equal(w_orig, w_fast)
-    assert _bytes_equal(rf_orig, rf_fast)
-    assert _status_key(st_orig) == _status_key(st_fast)
+    orig = np_balancer_numba(*_copy_args(args))
+    fast = np_balancer_numba_fast(*_copy_args(args))
+    _assert_same_result(orig, fast)
+    assert _only_outcome("single") in FAST_OUTCOMES
 
 
 @pytest.mark.parametrize("seed, sample_count", SIMUL_CASES)
-def test_simul_fast_kernel_is_bitwise_identical(seed, sample_count):
+def test_simul_fast_balancer_gives_identical_weights(seed, sample_count):
     args = _simul_problem(seed, sample_count)
-    w_orig, rf_orig, st_orig = np_simul_balancer_numba(*_copy_args(args))
-    w_fast, rf_fast, st_fast = np_simul_balancer_numba_fast(*_copy_args(args))
-    assert _bytes_equal(w_orig, w_fast)
-    assert _bytes_equal(rf_orig, rf_fast)
-    assert _status_key(st_orig) == _status_key(st_fast)
+    orig_args = _copy_args(args)
+    fast_args = _copy_args(args)
+    orig = np_simul_balancer_numba(*orig_args)
+    fast = np_simul_balancer_numba_fast(*fast_args)
+    _assert_same_result(orig, fast)
+    assert _only_outcome("simul") in FAST_OUTCOMES
+    # the original balances sub_weights and scales sub_controls in place
+    assert fast[0] is fast_args[8]
+    assert _bytes_equal(orig_args[8], fast_args[8])
+    assert _bytes_equal(orig_args[11], fast_args[11])
 
 
 def test_random_problems_exercise_the_edge_cases():
     """The generators really produce what the bitwise tests claim to cover."""
-    single = [_single_problem(seed) for seed, _ in SINGLE_CASES[:48]]
-    simul = [_simul_problem(seed) for seed, _ in SIMUL_CASES[:44]]
+    single = [_single_problem(seed) for seed, _ in SINGLE_CASES[:66]]
+    simul = [_simul_problem(seed) for seed, _ in SIMUL_CASES[:62]]
     assert {p[3].dtype for p in single} == {
         np.dtype(np.int64),
         np.dtype(np.float64),
@@ -236,17 +301,187 @@ def test_random_problems_exercise_the_edge_cases():
         assert layouts == {True, False}, dtype
     assert {p[8].flags.c_contiguous for p in simul} == {True, False}
     assert any(p[0] > 2000 for p in single) and any(p[0] < 10 for p in single)
+    assert {p[1] for p in single} >= {1} and max(p[1] for p in single) >= 28
+    assert min(p[2] for p in simul) == 1 and max(p[2] for p in simul) >= 11
     incidences = [np.asarray(p[3]) for p in single] + [p[4] for p in simul]
     assert any((inc == 0).all(axis=1).any() for inc in incidences)
     assert any((inc != 0).all(axis=1).any() for inc in incidences)
-    assert any((inc > 1).any() for inc in incidences)
+    assert any((inc == 6).any() for inc in incidences)
+    assert any((inc != np.round(inc)).any() for inc in incidences)
+    assert any((p[4] != np.round(p[4])).any() for p in simul)
     weights = np.concatenate([p[4].astype(np.float64) for p in single])
     assert (np.signbit(weights) & (weights == 0)).any()
     assert any((p[4] > p[6]).any() and (p[4] == p[5]).any() for p in single)
     assert any((p[4] < p[5]).any() for p in single)
     importances = np.concatenate([p[8].astype(np.float64) for p in single])
     assert importances.min() < 10 and importances.max() > 1e8
-    assert {p[2] for p in simul} >= {1, 12} or len({p[2] for p in simul}) > 8
+
+
+def test_the_lookup_kernels_are_the_primary_path():
+    """Almost every random problem uses the fast result, not a re-run."""
+    for seed in range(20):
+        np_balancer_numba_fast(*_single_problem(seed + 500))
+        np_simul_balancer_numba_fast(*_simul_problem(seed + 500))
+    counts = fast_path_counts()
+    for kind in ("single", "simul"):
+        assert counts[kind]["fast"] >= 18, counts
+        assert sum(counts[kind].values()) == 20, counts
+
+
+def test_encoding_holds_the_exact_float64_values():
+    inc = np.array(
+        [[0, 0.1, 2, 0.1, 0, 1.0 / 3.0], [1, 1, 1, 1, 1, 1]], dtype=np.float32
+    )
+    values, n_values, codes, status = balancers_numba._encode_incidence(inc, 256)
+    assert status == balancers_numba._ENCODE_OK
+    assert codes.dtype == np.uint8
+    assert list(n_values) == [4, 1]
+    expected = sorted(float(x) for x in set(inc[0].tolist()))
+    assert values[0, :4].tolist() == expected
+    assert values[0, :4].tobytes() == np.array(expected).tobytes()
+    assert values[1, 0] == 1.0
+    for c in range(2):
+        assert (values[c, codes[c]] == inc[c].astype(np.float64)).all()
+    assert (codes[1] == 0).all()
+
+
+def _problem_with_distinct_values(distinct, seed=5, sample_count=600):
+    rng = np.random.default_rng(seed)
+    inc = np.ones((3, sample_count))
+    inc[1] = (np.arange(sample_count) % distinct) * 0.01
+    inc[2] = rng.integers(0, 3, sample_count)
+    w = np.exp(rng.uniform(0.0, 2.0, sample_count))
+    lb = np.zeros(sample_count)
+    ub = np.full(sample_count, 1e6)
+    constraint = np.maximum(
+        (inc * rng.uniform(0.5, 2.0, sample_count)).sum(axis=1), 0.1
+    )
+    importance = np.array([1e9, 10.0, 10.0])
+    return (sample_count, 3, 0, inc, w, lb, ub, constraint, importance, 100)
+
+
+def test_value_cap_runs_the_original_kernel_and_is_counted(caplog):
+    args = _problem_with_distinct_values(257)
+    with caplog.at_level(logging.WARNING, logger=balancers_numba.__name__):
+        fast = np_balancer_numba_fast(*_copy_args(args))
+    orig = np_balancer_numba(*_copy_args(args))
+    assert _status_key(orig[2]) == _status_key(fast[2])  # the original ran
+    _assert_same_result(orig, fast)
+    assert _only_outcome("single") == "fallback_value_cap"
+    assert any("distinct incidence values" in r.getMessage() for r in caplog.records)
+
+
+def test_value_cap_boundary_uses_the_lookup_kernel():
+    args = _problem_with_distinct_values(256)
+    fast = np_balancer_numba_fast(*_copy_args(args))
+    _assert_same_result(np_balancer_numba(*_copy_args(args)), fast)
+    assert _only_outcome("single") in FAST_OUTCOMES
+
+
+def _simul_problem_with_many_values(distinct):
+    for seed in range(100, 200):
+        args = list(_simul_problem(seed, 600))
+        if args[1] >= 2:
+            break
+    control = (args[3] + 1) % args[1]
+    inc = args[4].copy()
+    inc[control] = (np.arange(600) % distinct) * 0.01
+    args[4] = inc
+    return tuple(args)
+
+
+def test_simul_value_cap_runs_the_original_kernel_and_is_counted():
+    args = _simul_problem_with_many_values(300)
+    orig_args = _copy_args(args)
+    fast_args = _copy_args(args)
+    orig = np_simul_balancer_numba(*orig_args)
+    fast = np_simul_balancer_numba_fast(*fast_args)
+    assert _status_key(orig[2]) == _status_key(fast[2])
+    _assert_same_result(orig, fast)
+    assert _bytes_equal(orig_args[8], fast_args[8])
+    assert _bytes_equal(orig_args[11], fast_args[11])
+    assert _only_outcome("simul") == "fallback_value_cap"
+
+
+def test_nonfinite_incidence_runs_the_original_kernel():
+    args = list(_problem_with_distinct_values(3))
+    inc = args[3].copy()
+    inc[2, 7] = np.inf
+    args[3] = inc
+    fast = np_balancer_numba_fast(*_copy_args(args))
+    orig = np_balancer_numba(*_copy_args(args))
+    assert _bytes_equal(orig[0], fast[0])
+    assert _only_outcome("single") == "fallback_nonfinite"
+
+
+def test_svml_runs_the_original_kernel(monkeypatch):
+    monkeypatch.setattr(balancers_numba, "_svml_active", lambda: True)
+    args = _single_problem(3, 300)
+    fast = np_balancer_numba_fast(*_copy_args(args))
+    orig = np_balancer_numba(*_copy_args(args))
+    assert _status_key(orig[2]) == _status_key(fast[2])
+    _assert_same_result(orig, fast)
+    assert _only_outcome("single") == "fallback_svml"
+
+
+@pytest.mark.parametrize("seed", [2, 3, 4, 7])
+def test_delta_band_reruns_the_original_kernel(monkeypatch, caplog, seed):
+    """A band wide enough to hold every delta forces the re-run on every call."""
+    monkeypatch.setattr(balancers_numba, "FAST_PATH_DELTA_BAND", 1e300)
+    args = _single_problem(seed, 700)
+    with caplog.at_level(logging.WARNING, logger=balancers_numba.__name__):
+        fast = np_balancer_numba_fast(*_copy_args(args))
+    orig = np_balancer_numba(*_copy_args(args))
+    assert _status_key(orig[2]) == _status_key(fast[2])  # the original's delta
+    _assert_same_result(orig, fast)
+    assert _only_outcome("single") == "rerun_delta_band"
+    assert any("re-run" in r.getMessage() for r in caplog.records)
+
+    sargs = _simul_problem(seed, 700)
+    orig_args = _copy_args(sargs)
+    fast_args = _copy_args(sargs)
+    orig = np_simul_balancer_numba(*orig_args)
+    fast = np_simul_balancer_numba_fast(*fast_args)
+    assert _status_key(orig[2]) == _status_key(fast[2])
+    _assert_same_result(orig, fast)
+    # the re-run started from the untouched inputs and mutated them like the
+    # original does
+    assert _bytes_equal(orig_args[8], fast_args[8])
+    assert _bytes_equal(orig_args[11], fast_args[11])
+    assert _only_outcome("simul") == "rerun_delta_band"
+
+
+def test_lookup_kernel_reports_a_delta_inside_the_band():
+    """The kernel flag itself: off with a zero band, on with a huge one."""
+    args = _single_problem(2, 300)
+    values, n_values, codes, _ = balancers_numba._encode_incidence(args[3], 256)
+    for band, expected in ((0.0, False), (1e300, True)):
+        result = balancers_numba._np_balancer_lookup(
+            *_copy_args(args), values, n_values, codes, band
+        )
+        assert result[3] is expected
+
+
+def test_fallback_warnings_are_rate_limited(caplog):
+    args = _problem_with_distinct_values(300, sample_count=400)
+    with caplog.at_level(logging.WARNING, logger=balancers_numba.__name__):
+        for _ in range(7):
+            np_balancer_numba_fast(*_copy_args(args))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 5
+    assert "fast_path_counts()" in warnings[-1].getMessage()
+    assert fast_path_counts()["single"]["fallback_value_cap"] == 7
+
+
+def test_first_call_of_each_balancer_is_logged_once(caplog):
+    with caplog.at_level(logging.INFO, logger=balancers_numba.__name__):
+        for _ in range(3):
+            np_balancer_numba_fast(*_single_problem(1, 50))
+            np_simul_balancer_numba_fast(*_simul_problem(1, 50))
+    single = [r for r in caplog.records if "single balancer: kernel" in r.getMessage()]
+    simul = [r for r in caplog.records if "simul balancer: kernel" in r.getMessage()]
+    assert len(single) == 1 and "np_balancer_numba_fast" in single[0].getMessage()
+    assert len(simul) == 1 and "np_simul_balancer_numba_fast" in simul[0].getMessage()
 
 
 @pytest.fixture
@@ -317,6 +552,26 @@ def test_dispatch_selects_the_fast_kernel_only_with_numba_and_fast_paths(
 ):
     assert _list_balancer(use_numba, fast_paths).balancer is single
     assert _simul_balancer(use_numba, fast_paths).balancer is simul
+
+
+def test_balancer_classes_give_identical_weights_with_fast_paths(settings, monkeypatch):
+    monkeypatch.setattr(simul_balancer, "setting", config.setting)
+    status_off, weights_off, controls_off = _list_balancer(True, False).balance()
+    status_on, weights_on, controls_on = _list_balancer(True, True).balance()
+    assert _bytes_equal(weights_off["final"].values, weights_on["final"].values)
+    pd.testing.assert_frame_equal(controls_off, controls_on, check_exact=True)
+    assert status_off["iter"] == status_on["iter"]
+
+    off = _simul_balancer(True, False)
+    on = _simul_balancer(True, True)
+    status_off = off.balance()
+    status_on = on.balance()
+    pd.testing.assert_frame_equal(
+        off.sub_zone_weights, on.sub_zone_weights, check_exact=True
+    )
+    assert status_off["iter"] == status_on["iter"]
+    assert fast_path_counts()["single"]["fast"] == 1
+    assert fast_path_counts()["simul"]["fast"] == 1
 
 
 def test_balancers_default_to_the_upstream_kernels():
@@ -426,10 +681,13 @@ def test_example_run_unchanged_with_fast_paths(tmp_path, precision):
     assert len(off) > 0
     pd.testing.assert_frame_equal(on, off, check_exact=True)
 
-    def logged_fast_kernels(out):
+    def log_text(out):
         logs = list((tmp_path / out).rglob("*.log"))
         assert logs, f"no log file written under {out}"
-        return any("np_balancer_numba_fast" in p.read_text() for p in logs)
+        return "\n".join(p.read_text() for p in logs)
 
-    assert logged_fast_kernels("on"), "the fast kernels did not run"
-    assert not logged_fast_kernels("off")
+    on_log = log_text("on")
+    # the lookup kernels really ran (first-call lines of both balancers)
+    assert "single balancer: kernel np_balancer_numba_fast" in on_log
+    assert "simul balancer: kernel np_simul_balancer_numba_fast" in on_log
+    assert "np_balancer_numba_fast" not in log_text("off")

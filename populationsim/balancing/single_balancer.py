@@ -71,7 +71,8 @@ class ListBalancer:
             precision of the Numba calculations, either 'float64' or 'float32'.
         fast_paths : bool
             fork setting FAST_PATHS: with numba on, use ``np_balancer_numba_fast``,
-            whose result is identical bit for bit (default False: upstream kernel)
+            whose weights, relaxation factors and iteration count are identical
+            bit for bit (default False: upstream kernel)
         """
 
         assert isinstance(incidence_table, pd.DataFrame)

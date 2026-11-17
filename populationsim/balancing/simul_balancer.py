@@ -61,8 +61,9 @@ class SimultaneousListBalancer:
             name of the total_hh control column
         fast_paths : bool
             fork setting FAST_PATHS: with numba on, use
-            ``np_simul_balancer_numba_fast``, whose result is identical bit for
-            bit (default False: upstream kernel)
+            ``np_simul_balancer_numba_fast``, whose weights, relaxation factors
+            and iteration count are identical bit for bit (default False:
+            upstream kernel)
         """
         assert isinstance(incidence_table, pd.DataFrame)
         assert len(parent_weights.index) == len(incidence_table.index)
