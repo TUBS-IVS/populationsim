@@ -147,11 +147,24 @@ try:
 except Exception as exc:  # reported to the test, which decides
     error = repr(exc)
 inc = None
+integer_weights = None
 if error is None:
     inc = pipeline.get_table("incidence_table")
+    if int(n_models) >= 6:
+        wt = pipeline.get_table("PUMA_weights")
+        integer_weights = wt["integer_weight"].reindex(inc.index).tolist()
     inc = inc["sample_weight"].tolist()
     pipeline.close_pipeline()
-Path(result).write_text(json.dumps({"calls": calls, "weights": inc, "error": error}))
+Path(result).write_text(
+    json.dumps(
+        {
+            "calls": calls,
+            "weights": inc,
+            "integer_weights": integer_weights,
+            "error": error,
+        }
+    )
+)
 """
 
 
@@ -199,7 +212,9 @@ def _run_scaled_example(tmp_path, flag, n_models, factor=0.01):
 
 def test_flag_on_example_runs_to_seed_integerization(tmp_path):
     # Positive control: without the flag the scaled input yields zero-weight
-    # groups (stop right after setup_data_structures; balancing would divide by 0).
+    # groups. With the flag OFF balancing raises ZeroDivisionError on this input
+    # (all weights cast to 0), which is why the control stops after
+    # setup_data_structures.
     off = _run_scaled_example(tmp_path, False, n_models=2)
     assert off["error"] is None, off["error"]
     assert sum(1 for w in off["weights"] if w == 0) > 0
@@ -209,3 +224,9 @@ def test_flag_on_example_runs_to_seed_integerization(tmp_path):
     assert len(on["weights"]) > 0
     assert all(w > 0 for w in on["weights"])
     assert sum(on["calls"]) == len(on["weights"])
+    # Rescued groups exist, and at least one is actually chosen (primary path).
+    rescued = [
+        i for i, w in enumerate(on["weights"]) if 0 < w < 1
+    ]
+    assert len(rescued) > 0
+    assert any(on["integer_weights"][i] >= 1 for i in rescued)

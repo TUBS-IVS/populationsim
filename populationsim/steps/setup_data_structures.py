@@ -10,8 +10,8 @@ import numpy as np
 
 from populationsim.core import inject, pipeline, config
 from populationsim.core.assign import assign_variable
-from populationsim.integerizing import bs_options
 from populationsim.core.helper import control_table_name, get_control_data_table
+from populationsim.integerizing import bs_options
 
 logger = logging.getLogger(__name__)
 
