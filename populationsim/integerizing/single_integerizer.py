@@ -9,7 +9,7 @@ import pandas as pd
 from populationsim.core import config
 from populationsim.integerizing.constants import STATUS_OPTIMAL
 from populationsim.integerizing.smart_round import smart_round
-from populationsim.integerizing import lp_cvx, lp_ortools
+from populationsim.integerizing import bs_options, lp_cvx, lp_ortools
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,8 @@ class Integerizer:
         else:
             self.integerizer_func = lp_ortools.np_integerizer_ortools
 
-        self.timeout_in_seconds = config.setting("INTEGIZER_TIMEOUT", 60)
+        self.timeout_in_seconds = bs_options.integerizer_timeout_seconds()
+        bs_options.log_options_once()
 
     def integerize(self):
 
