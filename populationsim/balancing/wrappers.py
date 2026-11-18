@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from populationsim.core.config import setting
+from populationsim.core.bs_run_options import fast_paths
 from populationsim.balancing.single_balancer import ListBalancer
 from populationsim.balancing.simul_balancer import SimultaneousListBalancer
 from populationsim.balancing.constants import DEFAULT_MAX_ITERATIONS
@@ -114,6 +115,7 @@ def do_balancing(
         max_iterations=max_iterations,
         use_numba=use_numba,
         numba_precision=numba_precision,
+        fast_paths=fast_paths(),
     )
 
     status, weights, controls = balancer.balance()
@@ -196,6 +198,7 @@ def do_simul_balancing(
         total_hh_control_col=total_hh_control_col,
         use_numba=use_numba,
         numba_precision=numba_precision,
+        fast_paths=fast_paths(),
     )
 
     status = balancer.balance()

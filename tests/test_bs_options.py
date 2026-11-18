@@ -103,7 +103,7 @@ def test_call_rng_depends_on_seed_kind_and_label(settings):
         bs_options.call_rng("other", "TAZ_1")
 
 
-def test_options_logged_once(settings, caplog):
+def test_options_logged_once(settings, caplog, fork_logging):
     with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
         bs_options.log_options_once()
         bs_options.log_options_once()
