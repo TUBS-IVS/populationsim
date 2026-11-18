@@ -404,15 +404,43 @@ def test_simul_value_cap_runs_the_original_kernel_and_is_counted():
     assert _only_outcome("simul") == "fallback_value_cap"
 
 
-def test_nonfinite_incidence_runs_the_original_kernel():
+def _outcome_of(kernel, args):
+    """``("returned", result)`` or ``("raised", exception)`` of one kernel call."""
+    try:
+        return "returned", kernel(*_copy_args(args))
+    except Exception as exc:  # the behaviour itself is what is compared
+        return "raised", exc
+
+
+@pytest.mark.parametrize(
+    "bad_value", [np.inf, -np.inf, np.nan], ids=["inf", "-inf", "nan"]
+)
+def test_nonfinite_incidence_behaves_like_the_original_kernel(bad_value):
+    """Non-finite incidence is counted as a fallback and the fast wrapper then
+    does exactly what a direct call of the original kernel does on the same
+    input. What the original kernel does with such input is undefined under
+    ``fastmath`` and depends on the numba version (it may raise
+    ``ZeroDivisionError`` or return numbers), so both outcomes are handled: a
+    raise must be the same exception type, a result must be equal as raw bytes
+    (NaN patterns included)."""
     args = list(_problem_with_distinct_values(3))
     inc = args[3].copy()
-    inc[2, 7] = np.inf
+    inc[2, 7] = bad_value
     args[3] = inc
-    fast = np_balancer_numba_fast(*_copy_args(args))
-    orig = np_balancer_numba(*_copy_args(args))
-    assert _bytes_equal(orig[0], fast[0])
+    orig_kind, orig = _outcome_of(np_balancer_numba, args)
+    reset_fast_path_counts()
+    fast_kind, fast = _outcome_of(np_balancer_numba_fast, args)
     assert _only_outcome("single") == "fallback_nonfinite"
+    assert fast_kind == orig_kind, (orig_kind, orig, fast_kind, fast)
+    if orig_kind == "raised":
+        assert type(fast) is type(orig)
+    else:
+        weights, relaxation_factors, status = orig
+        assert _bytes_equal(weights, fast[0])
+        assert _bytes_equal(relaxation_factors, fast[1])
+        assert _bytes_equal(
+            np.asarray(status, dtype=np.float64), np.asarray(fast[2], dtype=np.float64)
+        )
 
 
 def test_svml_runs_the_original_kernel(monkeypatch):
