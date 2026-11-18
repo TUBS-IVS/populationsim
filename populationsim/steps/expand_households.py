@@ -38,8 +38,8 @@ def household_lists_for_groups(household_groups, group_ids, household_id_col):
         group ids that occur in the expanded weights (any order, repeats allowed).
         The step hands over an object array (the expanded table is built from
         values of mixed dtype); ``np.isin`` of such an array against the integer
-        group column compares element by element (65 s for 7,707 used groups
-        against 218,097 rows, 0.002 s after a cast), so the used ids are cast to
+        group column compares element by element (slower by orders of magnitude
+        than the sorted comparison of two integer arrays), so the used ids are cast to
         the dtype of the ``group_id`` column first. A ``ValueError`` is raised if
         the cast changes a value (a non-integral or non-numeric id).
     household_id_col : str

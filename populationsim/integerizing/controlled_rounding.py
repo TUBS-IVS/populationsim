@@ -20,8 +20,10 @@ feasible by construction, with this order of priorities. The problem is
 decided by :func:`populationsim.integerizing.controlled_search.solve_search`
 (``INTEGERIZER_CONTROLLED_METHOD: search``, the default: a network start and
 a swap search, a local optimum) or by the LP of
-:mod:`populationsim.integerizing.controlled_lp` (``lp``); the rules below are
-stated as that LP, whose relaxation the search approximates:
+:mod:`populationsim.integerizing.controlled_lp` (``lp``). The rules below are
+stated as that LP; the search meets rules 1 and 2 as far as both can hold,
+lowers the cell distance of rule 4 and does not price the parent totals of
+rule 3 (its module docstring says why they follow from rule 2):
 
 1. hard: the number of rows rounded up in each sub-zone is the number the
    final ``smart_round`` enforces anyway, ``k[z] = clip(N[z] - sum_h a[z, h],

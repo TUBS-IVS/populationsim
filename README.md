@@ -37,8 +37,9 @@ infeasible and the integerizer falls back to sequential integerizing.
 2. as far as rule 1 allows, every household row of the parent is placed exactly as often as its parent weight
    says (the weight summed over the sub-zones is kept);
 3. among such tables, the importance-weighted distance of the integer cell totals to the float cell totals is
-   lowered (the control's importance, clipped to the penalty floor and cap, is the weight): `lp` minimises
-   its relaxation, `search` ends in a local optimum that depends on its start table;
+   lowered (the control's importance, clipped to the penalty floor and cap, is the weight): `lp` solves a
+   linear relaxation to its optimum and then rounds fractional values jointly, `search` ends in a local
+   optimum that depends on its start table;
 4. the household keys (the draw keys, or `ln` of the residual) decide the start table of `search` and break
    the ties in `lp`.
 
