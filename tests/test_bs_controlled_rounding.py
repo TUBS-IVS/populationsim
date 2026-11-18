@@ -141,7 +141,9 @@ def test_household_count_is_what_smart_round_enforces():
         assert added == problem.hh_count[z]
 
 
-def test_household_count_counts_rows_not_household_total_incidence(caplog):
+def test_household_count_counts_rows_not_household_total_incidence(
+    caplog, fork_logging
+):
     # row 0 has integer part 2 but household-total incidence 0: smart_round
     # counts rows, so it needs 3 - 2 = 1 more household, not 3 - 0 = 3 (clipped
     # to the 2 rows with a residual)
@@ -1259,7 +1261,7 @@ def _failed(status_text):
 
 @pytest.mark.parametrize("failure", ["status", "not integral"])
 def test_repair_failure_keeps_the_lp_values_and_is_counted(
-    failure, monkeypatch, caplog
+    failure, monkeypatch, caplog, fork_logging
 ):
     def failing(arrays, solver, timeout_seconds, **kwargs):
         if failure == "status":
@@ -1325,7 +1327,7 @@ def _patch_failures(monkeypatch, failures):
 SECONDS = {"repair_seconds", "objective_seconds"}
 
 
-def test_retry_uses_the_second_solver_and_records_it(monkeypatch, caplog):
+def test_retry_uses_the_second_solver_and_records_it(monkeypatch, caplog, fork_logging):
     problem, inc, pinc, resid, _, _ = _random_case(0)
     direct_out, direct_status, direct_stats = controlled_lp.solve_controlled(
         problem, inc, pinc, resid, 0, "clp-dual", "none", True, 60
@@ -1383,7 +1385,9 @@ def test_retry_none_returns_the_first_failure(monkeypatch):
         )
 
 
-def test_both_solvers_failing_returns_the_input_residuals(monkeypatch, caplog):
+def test_both_solvers_failing_returns_the_input_residuals(
+    monkeypatch, caplog, fork_logging
+):
     problem, inc, pinc, resid, _, _ = _random_case(0)
     calls = _patch_failures(
         monkeypatch, {"highs-ds": "INFEASIBLE", "clp-dual": "ABNORMAL"}

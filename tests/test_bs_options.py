@@ -165,7 +165,7 @@ def test_penalty_settings_reject_invalid(settings, key, bad):
         bs_options.penalty_settings()
 
 
-def test_options_log_controlled_values(settings, caplog):
+def test_options_log_controlled_values(settings, caplog, fork_logging):
     settings["INTEGERIZER_ROUNDING"] = "controlled"
     with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
         bs_options.log_options_once()
@@ -228,7 +228,7 @@ def test_controlled_retry_solver_must_differ(settings):
     assert "INTEGERIZER_CONTROLLED_SOLVER" in str(exc.value)
 
 
-def test_options_log_controlled_solver_values(settings, caplog):
+def test_options_log_controlled_solver_values(settings, caplog, fork_logging):
     settings["INTEGERIZER_ROUNDING"] = "controlled"
     settings["INTEGERIZER_CONTROLLED_REPAIR"] = False
     with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
@@ -239,7 +239,7 @@ def test_options_log_controlled_solver_values(settings, caplog):
     assert "controlled_repair=False" in msg
 
 
-def test_options_log_omits_solver_values_in_round_mode(settings, caplog):
+def test_options_log_omits_solver_values_in_round_mode(settings, caplog, fork_logging):
     with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
         bs_options.log_options_once()
     msg = " ".join(r.getMessage() for r in caplog.records)
@@ -289,7 +289,7 @@ def test_search_settings_reject_invalid(settings, key, bad):
         bs_options.search_settings()
 
 
-def test_options_log_search_values(settings, caplog):
+def test_options_log_search_values(settings, caplog, fork_logging):
     settings["INTEGERIZER_ROUNDING"] = "controlled"
     settings["INTEGERIZER_SEARCH_SHORTLIST"] = 12
     with caplog.at_level(logging.INFO, logger=bs_options.logger.name):

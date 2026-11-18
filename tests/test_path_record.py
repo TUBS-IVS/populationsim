@@ -661,7 +661,7 @@ def test_controlled_path_record_columns_and_counts(settings, method):
 
 
 def test_search_failure_is_recorded_and_handed_to_the_wrapper(
-    settings, monkeypatch, caplog
+    settings, monkeypatch, caplog, fork_logging
 ):
     from populationsim.integerizing import controlled_search
 
@@ -716,7 +716,9 @@ def _stub_stats(**changes):
     return stats
 
 
-def test_path_record_counts_fractional_lp_values(settings, monkeypatch, caplog):
+def test_path_record_counts_fractional_lp_values(
+    settings, monkeypatch, caplog, fork_logging
+):
     """A fractional LP solution: the count is recorded and warned about, and
     smart_round still gives every zone its household control."""
     from populationsim.integerizing import controlled_lp
@@ -764,7 +766,7 @@ def test_path_record_counts_fractional_lp_values(settings, monkeypatch, caplog):
 
 
 def test_controlled_lp_failure_is_recorded_and_handed_to_the_wrapper(
-    settings, monkeypatch, caplog
+    settings, monkeypatch, caplog, fork_logging
 ):
     from populationsim.integerizing import controlled_lp
 

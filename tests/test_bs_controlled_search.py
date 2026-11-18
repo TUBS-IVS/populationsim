@@ -434,7 +434,7 @@ def _stats(**changes):
         ("ABNORMAL", {}, "status ABNORMAL"),
     ],
 )
-def test_search_call_log_lines(status, changes, reason, caplog):
+def test_search_call_log_lines(status, changes, reason, caplog, fork_logging):
     from populationsim.integerizing import simul_integerizer
 
     with caplog.at_level(logging.INFO, logger=simul_integerizer.logger.name):
