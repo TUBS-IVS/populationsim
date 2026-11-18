@@ -345,6 +345,15 @@ def log_fast_path_rate(logger=None):
     INFO when every call took the fast kernel, WARNING when any call fell back
     to the original kernel or was re-run after the delta guard. Registered with
     ``atexit`` on the first fast call, so every run ends with this line.
+
+    Nothing is logged when no call was counted (all counts zero, e.g. after
+    ``reset_fast_path_counts``): a "0 of 0 calls" line would only be noise.
+
+    The line is written at interpreter exit, where a log handler's stream may
+    already be closed (a pytest process, a redirected stream). The logging module
+    would then print a ``--- Logging error ---`` traceback on stderr, so
+    ``logging.raiseExceptions`` is switched off around this one call and restored
+    afterwards. A summary that cannot be written is dropped, never an error.
     """
     logger = logger or globals()["logger"]
     totals = dict.fromkeys(_FAST_PATH_OUTCOMES, 0)
@@ -352,20 +361,27 @@ def log_fast_path_rate(logger=None):
         for outcome, n in counts.items():
             totals[outcome] += n
     calls = sum(totals.values())
-    percent = 100.0 * totals["fast"] / calls if calls else 0.0
+    if calls == 0:
+        return
+    percent = 100.0 * totals["fast"] / calls
     level = logging.INFO if calls == totals["fast"] else logging.WARNING
-    logger.log(
-        level,
-        "balancer fast path: fast %d of %d calls (%.1f %%), fallback value cap %d, "
-        "fallback SVML %d, fallback non-finite %d, re-run after the delta guard %d",
-        totals["fast"],
-        calls,
-        percent,
-        totals["fallback_value_cap"],
-        totals["fallback_svml"],
-        totals["fallback_nonfinite"],
-        totals["rerun_delta_band"],
-    )
+    previous = logging.raiseExceptions
+    logging.raiseExceptions = False
+    try:
+        logger.log(
+            level,
+            "balancer fast path: fast %d of %d calls (%.1f %%), fallback value cap %d, "
+            "fallback SVML %d, fallback non-finite %d, re-run after the delta guard %d",
+            totals["fast"],
+            calls,
+            percent,
+            totals["fallback_value_cap"],
+            totals["fallback_svml"],
+            totals["fallback_nonfinite"],
+            totals["rerun_delta_band"],
+        )
+    finally:
+        logging.raiseExceptions = previous
 
 
 def _register_exit_summary():

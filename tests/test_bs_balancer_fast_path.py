@@ -38,6 +38,7 @@ from populationsim.balancing.single_balancer import ListBalancer
 from populationsim.balancing.simul_balancer import SimultaneousListBalancer
 from populationsim.core import config
 from tests.bs_differential import REPO_ROOT, run_example
+from tests.settings_isolation import patch_settings
 
 # Row counts that are and are not multiples of the SIMD widths (2, 4, 8).
 EDGE_SIZES = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 63, 65, 127, 129, 5000]
@@ -486,15 +487,9 @@ def test_first_call_of_each_balancer_is_logged_once(caplog, fork_logging):
 
 @pytest.fixture
 def settings(monkeypatch):
-    """Inject a settings dict by patching config.setting (and the wrapper's import)."""
-    values = {}
-
-    def fake_setting(key, default=None):
-        return values.get(key, default)
-
-    monkeypatch.setattr(config, "setting", fake_setting)
-    monkeypatch.setattr(wrappers, "setting", fake_setting)
-    return values
+    """Inject a settings dict by patching config.setting and every module that
+    imported it by name (see tests/settings_isolation.py); restored at teardown."""
+    return patch_settings(monkeypatch)
 
 
 def _list_balancer(use_numba, fast_paths):
@@ -753,6 +748,40 @@ def test_rate_line_goes_to_a_given_logger(caplog, fork_logging):
         balancers_numba.log_fast_path_rate(other)
     (record,) = _rate_records(caplog)
     assert record.name == other.name
+
+
+def test_rate_line_is_skipped_when_no_call_was_counted(caplog, fork_logging):
+    """All counts zero (nothing ran, or the counts were reset): no line at all."""
+    assert all(
+        n == 0 for counts in fast_path_counts().values() for n in counts.values()
+    )
+    with caplog.at_level(logging.DEBUG, logger=balancers_numba.__name__):
+        balancers_numba.log_fast_path_rate()
+    assert _rate_records(caplog) == []
+
+
+def test_rate_line_at_exit_survives_a_closed_stream(capsys, monkeypatch):
+    """At interpreter exit the handler's stream may be closed already; logging
+    would then print ``--- Logging error ---`` on stderr. The summary must be
+    silent there and must restore ``logging.raiseExceptions``."""
+    import io
+
+    np_balancer_numba_fast(*_copy_args(_single_problem(1, 50)))
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    stream.close()
+    other = logging.getLogger("populationsim.test_closed_stream_target")
+    other.addHandler(handler)
+    other.propagate = False
+    other.setLevel(logging.INFO)
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    capsys.readouterr()
+    try:
+        balancers_numba.log_fast_path_rate(other)
+    finally:
+        other.removeHandler(handler)
+    assert "Logging error" not in capsys.readouterr().err
+    assert logging.raiseExceptions is True
 
 
 def test_rate_summary_is_registered_with_atexit_once(monkeypatch):

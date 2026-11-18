@@ -19,18 +19,16 @@ from populationsim.core import config
 from populationsim.core import positive_weight_rows as pwr
 from populationsim.integerizing import wrappers
 from tests.bs_differential import REPO_ROOT, run_example
+from tests.settings_isolation import patch_settings
 
 SETTING = "STORE_POSITIVE_WEIGHT_ROWS_ONLY"
 
 
 @pytest.fixture
 def settings(monkeypatch):
-    """Inject a settings dict by patching config.setting."""
-    values = {}
-    monkeypatch.setattr(
-        config, "setting", lambda key, default=None: values.get(key, default)
-    )
-    return values
+    """Inject a settings dict by patching config.setting and every module that
+    imported it by name (see tests/settings_isolation.py); restored at teardown."""
+    return patch_settings(monkeypatch)
 
 
 class _ListHandler(logging.Handler):
@@ -332,7 +330,6 @@ def _sub_balancing_problem(tract_weights):
 
 
 def _run_sub_balancing(monkeypatch, settings, problem, positive_only, stored=None):
-    from populationsim.balancing import wrappers as balancing_wrappers
     from populationsim.core import inject
     from populationsim.steps import sub_balancing as step
 
@@ -346,7 +343,6 @@ def _run_sub_balancing(monkeypatch, settings, problem, positive_only, stored=Non
             SETTING: positive_only,
         }
     )
-    monkeypatch.setattr(balancing_wrappers, "setting", config.setting)
     tract = dense_tract
     if stored is not None:
         tract = stored
@@ -376,6 +372,42 @@ INTEGERIZERS = pytest.mark.parametrize(
     ],
     ids=["simul", "sequential", "no_integerizing", "integer_parent_weights", "numba"],
 )
+
+
+def test_settings_fixture_replaces_a_setting_bound_by_name(monkeypatch):
+    """Regression for the order dependence of the step-driving tests: when another
+    test file had imported ``simul_balancer`` first, it kept the REAL ``setting``,
+    the balancer read the ``settings`` injectable and that read ``settings.yaml``
+    from a ``configs`` directory that does not exist (``RuntimeError: 'configs'
+    directory does not exist``). Put the global state into that shape explicitly
+    (the real function bound in both balancing modules, the real injectables
+    unreadable), then set up the settings as the ``settings`` fixture does and run
+    the real step."""
+    from populationsim.balancing import simul_balancer
+    from populationsim.balancing import wrappers as balancing_wrappers
+    from populationsim.core import inject
+
+    real_get_injectable = inject.get_injectable
+
+    def refuse_real_injectables(name):
+        if name in ("settings", "configs_dir"):
+            raise RuntimeError("'configs' directory does not exist")
+        return real_get_injectable(name)
+
+    real_setting = config.setting
+    monkeypatch.setattr(inject, "get_injectable", refuse_real_injectables)
+    monkeypatch.setattr(simul_balancer, "setting", real_setting)
+    monkeypatch.setattr(balancing_wrappers, "setting", real_setting)
+    with pytest.raises(RuntimeError, match="'configs' directory does not exist"):
+        simul_balancer.setting("MAX_BALANCE_ITERATIONS_SIMULTANEOUS", 1)
+
+    settings = patch_settings(monkeypatch)
+    assert simul_balancer.setting("MAX_BALANCE_ITERATIONS_SIMULTANEOUS", 7) == 7
+    problem = _sub_balancing_problem(
+        {10: [2.0, 1.5, 0.0, 3.0, 1.0, 0.5], 11: [1.0, 0.0, 0.0, 2.0, 0.0, 1.0]}
+    )
+    added = _run_sub_balancing(monkeypatch, settings, problem, False)
+    assert len(added["TAZ_weights"]) == 18
 
 
 @INTEGERIZERS

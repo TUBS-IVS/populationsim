@@ -27,23 +27,20 @@ import pandas as pd
 import pytest
 import yaml
 
-from populationsim.core import config
 from populationsim.integerizing import lp_cvx, lp_ortools, lp_single_fast
 from populationsim.integerizing.single_integerizer import Integerizer
 from populationsim.steps import expand_households as eh
 from tests.bs_differential import REPO_ROOT, run_example
+from tests.settings_isolation import patch_settings
 
 SETTING = "FAST_PATHS"
 
 
 @pytest.fixture
 def settings(monkeypatch):
-    """Inject a settings dict by patching config.setting."""
-    values = {}
-    monkeypatch.setattr(
-        config, "setting", lambda key, default=None: values.get(key, default)
-    )
-    return values
+    """Inject a settings dict by patching config.setting and every module that
+    imported it by name (see tests/settings_isolation.py); restored at teardown."""
+    return patch_settings(monkeypatch)
 
 
 # --- A. single integerizer LP build -------------------------------------------
