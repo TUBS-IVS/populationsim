@@ -23,8 +23,11 @@ as hard rules and then lowers the cell distance:
    with ``goal = band_lo + frac``, the float cell total in the units of ``x``
    (after subtracting the integer parts).
 
-The parent totals of the LP method are not priced here: with every row's
-parent weight kept they are already met wherever the margins hold.
+The parent totals of the LP method are not priced here. Where every row
+meets its ``conserve_target``, the integer parent total of every control is
+``sum_h (sum_z a[z, h] + conserve_target[h]) * inc[h, c]``; it equals the
+float parent total when every row's weight summed over the sub-zones is an
+integer (as the balancer leaves it), and can differ from it otherwise.
 
 How
 ---
