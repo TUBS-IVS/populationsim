@@ -1,6 +1,6 @@
 [project]
 name = "populationsim"
-version = "0.10.0+bs.1"
+version = "0.10.0+bs.2"
 description = "Population Synthesis (for ActivitySim)"
 authors = [
     { name = "Ben Stabler", email = "ben.stabler@rsginc.com" }
@@ -20,6 +20,7 @@ dependencies = [
     "cvxpy[glpk]>=1.6.5",
     "numba>=0.60.0",
     "pyarrow>=20.0.0",
+    "scipy>=1.9",
 ]
 
 [dependency-groups]
