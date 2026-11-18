@@ -84,7 +84,7 @@ def test_flag_on_integer_weights_identical(settings):
         assert on[col].tolist() == off[col].tolist()
 
 
-def test_flag_on_logs_rescued_groups(settings, caplog):
+def test_flag_on_logs_rescued_groups(settings, caplog, fork_logging):
     settings["KEEP_FRACTIONAL_SAMPLE_WEIGHTS"] = True
     with caplog.at_level(logging.INFO):
         _build(WEIGHTS)
@@ -95,7 +95,7 @@ def test_flag_on_logs_rescued_groups(settings, caplog):
     assert "do_simul_integerizing" not in caplog.text
 
 
-def test_flag_off_logs_no_fractional_line(settings, caplog):
+def test_flag_off_logs_no_fractional_line(settings, caplog, fork_logging):
     with caplog.at_level(logging.INFO):
         _build(WEIGHTS)
     assert "fractional sample weights kept" not in caplog.text
@@ -225,8 +225,6 @@ def test_flag_on_example_runs_to_seed_integerization(tmp_path):
     assert all(w > 0 for w in on["weights"])
     assert sum(on["calls"]) == len(on["weights"])
     # Rescued groups exist, and at least one is actually chosen (primary path).
-    rescued = [
-        i for i, w in enumerate(on["weights"]) if 0 < w < 1
-    ]
+    rescued = [i for i, w in enumerate(on["weights"]) if 0 < w < 1]
     assert len(rescued) > 0
     assert any(on["integer_weights"][i] >= 1 for i in rescued)

@@ -188,7 +188,7 @@ def test_multiprocess_without_record_is_fine(settings):
     assert _single().integerize() in ("OPTIMAL", "FEASIBLE")
 
 
-def test_record_logs_one_info_line(settings, caplog):
+def test_record_logs_one_info_line(settings, caplog, fork_logging):
     settings["INTEGERIZER_PATH_RECORD"] = True
     with caplog.at_level("INFO"):
         _single().integerize()
@@ -287,9 +287,7 @@ def test_each_wrapper_branch_writes_its_outcome(
         return status, (_df("S") if isinstance(result, str) else result)
 
     monkeypatch.setattr(wrappers, "try_simul_integerizing", fake_try)
-    monkeypatch.setattr(
-        wrappers, "do_sequential_integerizing", lambda *a, **k: seq
-    )
+    monkeypatch.setattr(wrappers, "do_sequential_integerizing", lambda *a, **k: seq)
     wrappers.do_simul_integerizing(**_wrapper_inputs(zone_ids))
     assert not queue
     rows = _rows(settings["_record_path"])
@@ -440,7 +438,9 @@ def test_record_on_example(tmp_path):
     assert keys and len(keys) == len(set(keys))
     # every parent solved once (first simul call, not a retry) has its outcome
     parents = [
-        r for r in calls if r["kind"] == "simul" and not r["trace_label"].startswith("retry_")
+        r
+        for r in calls
+        if r["kind"] == "simul" and not r["trace_label"].startswith("retry_")
     ]
     assert len(keys) == len(parents)
     for geography in ("TRACT", "TAZ"):
@@ -500,9 +500,9 @@ def test_record_ignores_output_file_prefix(settings, monkeypatch, tmp_path):
         monkeypatch.setattr(
             config,
             "setting",
-            lambda key, default=None: True
-            if key == "INTEGERIZER_PATH_RECORD"
-            else default,
+            lambda key, default=None: (
+                True if key == "INTEGERIZER_PATH_RECORD" else default
+            ),
         )
         bs_options.reset_for_tests()
         path_record.record_outcome("simultaneous", geography="TAZ")

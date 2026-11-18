@@ -360,7 +360,7 @@ def _problem_with_distinct_values(distinct, seed=5, sample_count=600):
     return (sample_count, 3, 0, inc, w, lb, ub, constraint, importance, 100)
 
 
-def test_value_cap_runs_the_original_kernel_and_is_counted(caplog):
+def test_value_cap_runs_the_original_kernel_and_is_counted(caplog, fork_logging):
     args = _problem_with_distinct_values(257)
     with caplog.at_level(logging.WARNING, logger=balancers_numba.__name__):
         fast = np_balancer_numba_fast(*_copy_args(args))
@@ -425,7 +425,7 @@ def test_svml_runs_the_original_kernel(monkeypatch):
 
 
 @pytest.mark.parametrize("seed", [2, 3, 4, 7])
-def test_delta_band_reruns_the_original_kernel(monkeypatch, caplog, seed):
+def test_delta_band_reruns_the_original_kernel(monkeypatch, caplog, fork_logging, seed):
     """A band wide enough to hold every delta forces the re-run on every call."""
     monkeypatch.setattr(balancers_numba, "FAST_PATH_DELTA_BAND", 1e300)
     args = _single_problem(seed, 700)
@@ -462,7 +462,7 @@ def test_lookup_kernel_reports_a_delta_inside_the_band():
         assert result[3] is expected
 
 
-def test_fallback_warnings_are_rate_limited(caplog):
+def test_fallback_warnings_are_rate_limited(caplog, fork_logging):
     args = _problem_with_distinct_values(300, sample_count=400)
     with caplog.at_level(logging.WARNING, logger=balancers_numba.__name__):
         for _ in range(7):
@@ -473,7 +473,7 @@ def test_fallback_warnings_are_rate_limited(caplog):
     assert fast_path_counts()["single"]["fallback_value_cap"] == 7
 
 
-def test_first_call_of_each_balancer_is_logged_once(caplog):
+def test_first_call_of_each_balancer_is_logged_once(caplog, fork_logging):
     with caplog.at_level(logging.INFO, logger=balancers_numba.__name__):
         for _ in range(3):
             np_balancer_numba_fast(*_single_problem(1, 50))
@@ -646,7 +646,7 @@ def test_wrappers_pass_the_fast_paths_setting(settings, monkeypatch, flag):
     assert seen["fast_paths"] is bool(flag)
 
 
-def test_fast_kernel_choice_is_logged_once(monkeypatch, caplog):
+def test_fast_kernel_choice_is_logged_once(monkeypatch, caplog, fork_logging):
     monkeypatch.setattr(balancers_numba, "_LOGGED_KERNEL_CHOICES", set())
     with caplog.at_level(logging.INFO, logger=balancers_numba.__name__):
         for _ in range(3):
@@ -660,7 +660,7 @@ def test_fast_kernel_choice_is_logged_once(monkeypatch, caplog):
     assert "np_simul_balancer_numba_fast" in lines[0].getMessage()
 
 
-def test_fast_paths_without_numba_is_logged_once(monkeypatch, caplog):
+def test_fast_paths_without_numba_is_logged_once(monkeypatch, caplog, fork_logging):
     monkeypatch.setattr(balancers_numba, "_LOGGED_KERNEL_CHOICES", set())
     with caplog.at_level(logging.INFO, logger=balancers_numba.__name__):
         for _ in range(3):
