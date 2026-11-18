@@ -14,6 +14,7 @@ import pandas as pd
 import yaml
 
 from populationsim.core import config, inject, mem, pipeline, tracing, util
+from populationsim.core import positive_weight_rows
 
 logger = logging.getLogger(__name__)
 
@@ -699,10 +700,18 @@ def coalesce_pipelines(sub_proc_names, slice_info):
         pipeline.replace_table(table_name, df)
 
     # - concatenate omnibus tables and add them to pipeline
+    coalesced_tables = {}
     for table_name in omnibus_tables:
         df = pd.concat(omnibus_tables[table_name], sort=False)
         info(f"adding omnibus table {table_name} {df.shape}")
         pipeline.replace_table(table_name, df)
+        coalesced_tables[table_name] = df
+
+    # fork: one rate line per coalesced positive-row weight table (no-op unless
+    # STORE_POSITIVE_WEIGHT_ROWS_ONLY); after the loop, so the crosswalk it reads is
+    # the coalesced one
+    for table_name, df in coalesced_tables.items():
+        positive_weight_rows.log_coalesced_table(table_name, df, len(sub_proc_names))
 
     pipeline.add_checkpoint(checkpoint_name)
 

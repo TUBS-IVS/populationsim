@@ -1,6 +1,7 @@
 # PopulationSim
 # See full license in LICENSE.txt.
 
+import contextlib
 import logging
 
 import pandas as pd
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def _rebuilt_parent_weights(
-    weights_df, parent_geography, parent_id, household_id_col, column, order
+    weights_df, geography, parent_geography, parent_id, household_id_col, column, order
 ):
     """Fork: full-length parent weights from a positive-row parent table.
 
@@ -33,11 +34,18 @@ def _rebuilt_parent_weights(
     incidence index of the parent's seed zone: the row order the dense table has
     for every parent (the seed weight table is built in incidence order, and each
     sub level copies its parent vector's order); see
-    :func:`populationsim.core.positive_weight_rows.rebuild_parent_weights`.
+    :func:`populationsim.core.positive_weight_rows.rebuild_parent_weights`, which
+    refuses a parent without any stored row.
     """
     parent_rows = weights_df[weights_df[parent_geography] == parent_id]
     return positive_weight_rows.rebuild_parent_weights(
-        parent_rows, household_id_col, column, order
+        parent_rows,
+        household_id_col,
+        column,
+        order,
+        geography=geography,
+        parent_geography=parent_geography,
+        parent_id=parent_id,
     )
 
 
@@ -185,10 +193,11 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
 
     Fork: with ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` the weight table (and the
     ``trace_<geography>_weights`` table) holds only the rows with a positive
-    balanced or integer weight, one INFO line reports the kept share, and a parent
-    table of a sub-geography is read back to full length with zeros. The
-    ``_sparse`` table is unchanged (see
-    :mod:`populationsim.core.positive_weight_rows`).
+    balanced or integer weight, one INFO line reports the kept share (checked
+    against the dense row count of the crosswalk and controls), and a parent
+    table of a sub-geography is read back to full length with zeros; a parent
+    zone with controls but no stored row raises. The ``_sparse`` table is
+    unchanged (see :mod:`populationsim.core.positive_weight_rows`).
     """
 
     positive_only = store_positive_weight_rows_only()
@@ -258,6 +267,7 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
             if positive_only and parent_geography != seed_geography:
                 initial_weights = _rebuilt_parent_weights(
                     weights_df,
+                    geography,
                     parent_geography,
                     parent_id,
                     settings.get("household_id_col"),
@@ -285,19 +295,25 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
                 seed_incidence_df.index
             ), "seed table and initial weights table do not match, possibly due to overlapping zones in crosswalk."
 
-            zone_weights_df = balance_and_integerize(
-                incidence_df=seed_incidence_df,
-                parent_weights=initial_weights,
-                sub_controls_df=sub_controls_df,
-                control_spec=control_spec,
-                total_hh_control_col=total_hh_control_col,
-                parent_geography=parent_geography,
-                parent_id=parent_id,
-                sub_geographies=sub_geographies,
-                crosswalk_df=seed_crosswalk_df,
-                use_numba=use_numba,
-                numba_precision=numba_precision,
+            scope = (
+                positive_weight_rows.tally_scope(geography, parent_id)
+                if positive_only
+                else contextlib.nullcontext()
             )
+            with scope:
+                zone_weights_df = balance_and_integerize(
+                    incidence_df=seed_incidence_df,
+                    parent_weights=initial_weights,
+                    sub_controls_df=sub_controls_df,
+                    control_spec=control_spec,
+                    total_hh_control_col=total_hh_control_col,
+                    parent_geography=parent_geography,
+                    parent_id=parent_id,
+                    sub_geographies=sub_geographies,
+                    crosswalk_df=seed_crosswalk_df,
+                    use_numba=use_numba,
+                    numba_precision=numba_precision,
+                )
 
             # add higher level geography id columns to facilitate summaries
             parent_geography_ids = crosswalk_df.loc[
@@ -310,7 +326,21 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
 
     if positive_only:
         integer_weights_df = positive_weight_rows.concat_kept(integer_weights_list)
-        positive_weight_rows.log_row_tally(geography)
+        dense_keys = positive_weight_rows.dense_zone_keys(
+            crosswalk_df,
+            geography,
+            parent_geography,
+            seed_geography,
+            sub_controls_df.index,
+            parent_controls_df.index,
+        )
+        positive_weight_rows.log_row_tally(
+            geography,
+            stored_rows=len(integer_weights_df.index),
+            dense_rows=positive_weight_rows.dense_row_count(
+                dense_keys, incidence_df, seed_geography
+            ),
+        )
     else:
         integer_weights_df = pd.concat(integer_weights_list)
 
