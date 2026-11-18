@@ -32,15 +32,18 @@ infeasible and the integerizer falls back to sequential integerizing.
 
 **What `controlled` does.** The rounding of one parent zone always has a solution and follows this order:
 
-1. every household row of the parent is placed exactly as often as its parent weight says (the weight summed
+1. every sub-zone gets the household count that the final `smart_round` enforces in both modes: its integer
+   parts plus `clip(household control - integer parts, 0, rows of the parent)`;
+2. every household row of the parent is placed exactly as often as its parent weight says (the weight summed
    over the sub-zones is kept);
-2. every sub-zone gets its household count (the number of rows that the final `smart_round` enforces anyway);
 3. among such tables, the importance-weighted distance of the integer cell totals to the float cell totals is
    as small as possible (the control's importance, clipped to the penalty floor and cap, is the weight);
 4. the household keys (the draw keys, or `ln` of the residual) only break the remaining ties.
 
-Where the zone counts and the parent weights cannot both hold, the shortfall is counted in the path record,
-not hidden; `smart_round` then adds the missing round-ups.
+Rule 1 wins where rules 1 and 2 cannot both hold (the household controls of the sub-zones do not add up to the
+parent's households, or a control asks for more than the rows with a residual can supply). What the rows cannot
+place is counted in the path record (`row_shortfall`, `zone_shortfall`, `hh_unreachable`, `hh_outside_lp`,
+`hh_excess`), not hidden, and `smart_round` adds the round-ups a zone still needs.
 
 **Two methods** (`INTEGERIZER_CONTROLLED_METHOD`):
 
@@ -70,6 +73,11 @@ not hidden; `smart_round` then adds the missing round-ups.
 - `search` ends in a local optimum, not a proven one. The shortlist ranks single moves, so a swap that only
   pays as a pair may be missed; a shortlist at least as large as the largest zone prices every legal swap.
   `converged` in the path record tells whether the search stopped by itself (1) or by the sweep limit (0).
+- The household total of a run can differ from a `round` run of the same inputs. On the simultaneous path both
+  modes give a sub-zone the count of rule 1; where upstream's programme is infeasible, `round` takes the
+  sequential path, which only sees the rows with a weight in that zone. In `examples/example_test` two
+  sub-zones whose household control the balanced weights cannot reach therefore get 15 households instead of
+  14 (`test_controlled_zone_household_counts_follow_smart_round` in `tests/test_bs_release_equivalence.py`).
 - Conserving every row's parent weight needs integer parent weights, i.e.
   `SUB_BALANCE_WITH_FLOAT_SEED_WEIGHTS: false`. With float seed weights the integer parent totals can differ
   from the float ones.

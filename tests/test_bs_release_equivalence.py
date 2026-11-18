@@ -11,6 +11,7 @@
 Each example run is a subprocess; every run is made once per module.
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -74,7 +75,7 @@ def controlled_run(tmp_path_factory):
     """Controlled rounding (search) with every option on."""
     out = tmp_path_factory.mktemp("controlled") / "out"
     ids = run_example(REPO_ROOT, out, {**CONTROLLED, **RUN_TIME_OPTIONS})
-    return ids, _read_record(out)
+    return ids, _read_record(out), out
 
 
 def test_round_mode_equals_bs1(tmp_path, bs1_run):
@@ -99,7 +100,7 @@ def test_run_options_do_not_change_round_mode(tmp_path, bs1_run):
 
 def test_example_controlled_with_every_option_on(tmp_path, default_run, controlled_run):
     """Controlled rounding (search) with every option on finishes cleanly."""
-    ids, record = controlled_run
+    ids, record, _ = controlled_run
     assert len(default_run) > 0
     assert len(ids) > 0
     assert list(record.columns) == list(path_record.CONTROLLED_COLUMNS)
@@ -129,22 +130,49 @@ def test_example_controlled_with_every_option_on(tmp_path, default_run, controll
     pd.testing.assert_frame_equal(off, ids)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN FINDING (#646): the controlled rounding (search) gives 1502 expanded "
-        "households in the example, the default run 1500: tracts 41 and 61 get 151 "
-        "instead of 150 (TAZ 402 and 602 get 15 instead of 14). The zone household "
-        "counts follow the integer household control while the rows keep their parent "
-        "weights, and the two do not add up in the example (hh_excess > 0 in the "
-        "record). Whether that is intended is for the owner of controlled_rounding "
-        "to decide; this test states the expectation of the release check."
-    ),
-)
-def test_controlled_household_total_equals_default_run(default_run, controlled_run):
-    ids, _ = controlled_run
-    assert len(default_run) > 0
-    assert len(ids) == len(default_run), "household total differs from the default run"
+def _latest_table(store, checkpoints, name):
+    """The table ``name`` of a checkpoint store as its last checkpoint wrote it."""
+    last = checkpoints[checkpoints[name] != ""].iloc[-1][name]
+    return store["/%s/%s" % (name, last)]
+
+
+def test_controlled_zone_household_counts_follow_smart_round(controlled_run):
+    """Every TAZ gets the household count that ``smart_round`` enforces.
+
+    ``smart_round`` adds ``clip(control - integer parts, 0, rows of the parent)``
+    to the integer parts of a sub-zone, and the controlled rounding takes that
+    count as given (rule 1 of ``controlled_rounding``). The example has TAZ
+    household controls that the balanced weights cannot reach, so its household
+    total is not the control total. It also differs from a ``round`` run: there
+    upstream's simultaneous LP is infeasible for two tracts, and the sequential
+    path, which only sees the rows with a weight in the zone, gives one zone of
+    each one household less.
+    """
+    ids, _, out = controlled_run
+    with pd.HDFStore(str(out / "pipeline.h5"), mode="r") as store:
+        checkpoints = store["/checkpoints"]
+        tract = _latest_table(store, checkpoints, "TRACT_weights")
+        taz = _latest_table(store, checkpoints, "TAZ_weights")
+        control = _latest_table(store, checkpoints, "TAZ_controls")["num_hh"]
+        crosswalk = _latest_table(store, checkpoints, "crosswalk")
+    tract_of = crosswalk.drop_duplicates("TAZ").set_index("TAZ")["TRACT"]
+    parent_rows = tract[tract["integer_weight"] > 0].groupby("TRACT").size()
+    zones = (
+        taz.assign(part=np.floor(taz["balanced_weight"]))
+        .groupby("TAZ")
+        .agg(parts=("part", "sum"), households=("integer_weight", "sum"))
+    )
+    need = control.reindex(zones.index) - zones["parts"]
+    rows = zones.index.map(tract_of).map(parent_rows).to_numpy()
+    expected = zones["parts"] + np.clip(need, 0, rows)
+
+    # the example exercises all three cases: a control already exceeded by the
+    # integer parts, a control beyond every row of the parent, and a reachable one
+    assert (need < 0).any() and (need > rows).any()
+    assert ((need >= 0) & (need <= rows)).any()
+    off = zones[zones["households"] != expected]
+    assert off.empty, off.assign(expected=expected.loc[off.index]).to_string()
+    assert len(ids) == int(expected.sum())
 
 
 def test_example_controlled_lp_with_every_option_on(tmp_path, default_run):
