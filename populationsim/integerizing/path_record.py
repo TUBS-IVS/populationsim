@@ -16,11 +16,15 @@ header of ``v0.10.0+bs.1``, byte for byte), :data:`CONTROLLED_COLUMNS` while it
 is ``controlled``. In controlled mode every row carries ``rounding``
 (``controlled`` on simultaneous call rows and on outcome rows, ``round`` on
 single-integerizer call rows, which keep upstream's rounding), and the
-simultaneous call rows carry the stats of
-:func:`populationsim.integerizing.controlled_lp.solve_controlled` (which
-documents them); ``build_s`` is the LP assembly there and ``solve_s`` the LP
-solves of all attempts plus the repair and its pricing solve. A NaN objective
-(failed solve or failed repair) is written as an empty field.
+simultaneous call rows carry ``method`` (``INTEGERIZER_CONTROLLED_METHOD``)
+and the stats of that method, which documents them: for ``search``
+:func:`populationsim.integerizing.controlled_search.solve_search` (``build_s``
+the network start, ``solve_s`` the swap search), for ``lp``
+:func:`populationsim.integerizing.controlled_lp.solve_controlled`
+(``build_s`` the LP assembly, ``solve_s`` the LP solves of all attempts plus
+the repair and its pricing solve). A column that the method of a call does
+not produce stays empty, as does a NaN (a failed solve, a failed repair, the
+distances after a failed start).
 """
 
 from __future__ import annotations
@@ -53,11 +57,23 @@ COLUMNS = (
     "draw",
     "random_seed",
 )
-# the stats of a controlled simultaneous call (controlled_lp.solve_controlled)
+# the stats of a controlled simultaneous call: method, then those of both
+# methods (controlled_search.solve_search, controlled_lp.solve_controlled);
+# each call fills the columns of its own method
 CONTROLLED_STATS = (
+    "method",
     "solver",
     "attempts",
     "x_count",
+    "swaps",
+    "sweeps",
+    "converged",
+    "distance_start",
+    "distance_final",
+    "flow_wanted",
+    "flow_achieved",
+    "zone_shortfall",
+    "row_shortfall",
     "fractional_x",
     "repaired_x",
     "fractional_after_repair",
@@ -168,7 +184,9 @@ def record_call(
     _append(row)
 
 
-def record_outcome(outcome, geography="", trace_label="", zones=None, rounded_zones=None):
+def record_outcome(
+    outcome, geography="", trace_label="", zones=None, rounded_zones=None
+):
     """Append one ``outcome`` row (one parent); no-op unless the record is on."""
     if not bs_options.path_record_enabled():
         return

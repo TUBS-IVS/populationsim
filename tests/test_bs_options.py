@@ -244,3 +244,57 @@ def test_options_log_omits_solver_values_in_round_mode(settings, caplog):
         bs_options.log_options_once()
     msg = " ".join(r.getMessage() for r in caplog.records)
     assert "controlled_solver" not in msg
+    assert "controlled_method" not in msg and "search_" not in msg
+
+
+def test_controlled_method_defaults_to_search(settings):
+    assert bs_options.controlled_method() == "search"
+    settings["INTEGERIZER_CONTROLLED_METHOD"] = "lp"
+    assert bs_options.controlled_method() == "lp"
+
+
+@pytest.mark.parametrize("bad", ["LP", "flow", "", None, True, 1])
+def test_controlled_method_rejects_unknown_value(settings, bad):
+    settings["INTEGERIZER_CONTROLLED_METHOD"] = bad
+    with pytest.raises(ValueError, match="INTEGERIZER_CONTROLLED_METHOD"):
+        bs_options.controlled_method()
+
+
+def test_search_settings_defaults_and_values(settings):
+    got = bs_options.search_settings()
+    assert isinstance(got, bs_options.SearchSettings)
+    assert tuple(got) == (200, 24)
+    settings["INTEGERIZER_SEARCH_MAX_SWEEPS"] = 1
+    settings["INTEGERIZER_SEARCH_SHORTLIST"] = 1
+    assert tuple(bs_options.search_settings()) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "key,bad",
+    [
+        ("INTEGERIZER_SEARCH_MAX_SWEEPS", 0),
+        ("INTEGERIZER_SEARCH_MAX_SWEEPS", -3),
+        ("INTEGERIZER_SEARCH_MAX_SWEEPS", 10.0),
+        ("INTEGERIZER_SEARCH_MAX_SWEEPS", "200"),
+        ("INTEGERIZER_SEARCH_MAX_SWEEPS", True),
+        ("INTEGERIZER_SEARCH_SHORTLIST", 0),
+        ("INTEGERIZER_SEARCH_SHORTLIST", 2.5),
+        ("INTEGERIZER_SEARCH_SHORTLIST", None),
+        ("INTEGERIZER_SEARCH_SHORTLIST", False),
+    ],
+)
+def test_search_settings_reject_invalid(settings, key, bad):
+    settings[key] = bad
+    with pytest.raises(ValueError, match=key):
+        bs_options.search_settings()
+
+
+def test_options_log_search_values(settings, caplog):
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    settings["INTEGERIZER_SEARCH_SHORTLIST"] = 12
+    with caplog.at_level(logging.INFO, logger=bs_options.logger.name):
+        bs_options.log_options_once()
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "controlled_method=search" in msg
+    assert "search_max_sweeps=200" in msg
+    assert "search_shortlist=12" in msg

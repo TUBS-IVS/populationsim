@@ -35,6 +35,15 @@ CONTROLLED_REPAIR_NAME = "INTEGERIZER_CONTROLLED_REPAIR"
 DEFAULT_CONTROLLED_SOLVER = "highs-ipm"
 DEFAULT_CONTROLLED_RETRY_SOLVER = "clp-dual"
 NO_RETRY = "none"
+CONTROLLED_METHOD_NAME = "INTEGERIZER_CONTROLLED_METHOD"
+# search: network start and swap search (controlled_search); lp: the LP with
+# repair (controlled_lp)
+CONTROLLED_METHODS = ("search", "lp")
+DEFAULT_CONTROLLED_METHOD = "search"
+SEARCH_MAX_SWEEPS_NAME = "INTEGERIZER_SEARCH_MAX_SWEEPS"
+SEARCH_SHORTLIST_NAME = "INTEGERIZER_SEARCH_SHORTLIST"
+DEFAULT_SEARCH_MAX_SWEEPS = 200
+DEFAULT_SEARCH_SHORTLIST = 24
 
 _logged = False
 
@@ -195,6 +204,42 @@ def controlled_repair():
     return _flag(CONTROLLED_REPAIR_NAME, True)
 
 
+def controlled_method():
+    """``INTEGERIZER_CONTROLLED_METHOD``: how the controlled rounding decides.
+
+    ``search`` (default): a network start and a swap search
+    (``controlled_search.solve_search``); ``lp``: the LP with retry and repair
+    (``controlled_lp.solve_controlled``, which reads the solver settings).
+    """
+    return _solver_name(
+        CONTROLLED_METHOD_NAME, DEFAULT_CONTROLLED_METHOD, CONTROLLED_METHODS
+    )
+
+
+class SearchSettings(NamedTuple):
+    """Limits of the swap search of the controlled rounding (``search``)."""
+
+    max_sweeps: int
+    shortlist: int
+
+
+def _count(key, default):
+    value = config.setting(key, default)
+    if not _is_int(value) or value < 1:
+        raise ValueError(f"{key} must be an integer >= 1, got {value!r}")
+    return int(value)
+
+
+def search_settings():
+    """``INTEGERIZER_SEARCH_MAX_SWEEPS`` (default 200): sweeps over all zone
+    pairs at most; ``INTEGERIZER_SEARCH_SHORTLIST`` (default 24): candidates
+    per zone priced for each zone pair. Both integers >= 1."""
+    return SearchSettings(
+        _count(SEARCH_MAX_SWEEPS_NAME, DEFAULT_SEARCH_MAX_SWEEPS),
+        _count(SEARCH_SHORTLIST_NAME, DEFAULT_SEARCH_SHORTLIST),
+    )
+
+
 def keep_fractional_sample_weights():
     """``KEEP_FRACTIONAL_SAMPLE_WEIGHTS`` (default False)."""
     return _flag("KEEP_FRACTIONAL_SAMPLE_WEIGHTS")
@@ -238,10 +283,13 @@ def log_options_once():
     if mode == "controlled":
         message += (
             " penalty_floor=%s penalty_cap=%s parent_total_factor=%s "
-            "conserve_penalty=%s controlled_solver=%s "
+            "conserve_penalty=%s controlled_method=%s search_max_sweeps=%s "
+            "search_shortlist=%s controlled_solver=%s "
             "controlled_retry_solver=%s controlled_repair=%s"
         )
         args.extend(penalty_settings())
+        args.append(controlled_method())
+        args.extend(search_settings())
         args.extend(
             [controlled_solver(), controlled_retry_solver(), controlled_repair()]
         )

@@ -9,7 +9,11 @@ import pandas as pd
 from populationsim.core import config
 from populationsim.integerizing.smart_round import smart_round
 from populationsim.integerizing import bs_options, draw, lp_ortools, lp_cvx, path_record
-from populationsim.integerizing import controlled_lp, controlled_rounding
+from populationsim.integerizing import (
+    controlled_lp,
+    controlled_rounding,
+    controlled_search,
+)
 from populationsim.integerizing.constants import STATUS_SUCCESS
 
 logger = logging.getLogger(__name__)
@@ -277,12 +281,15 @@ class SimulIntegerizer:
         """Fork: integerize with the controlled rounding (``INTEGERIZER_ROUNDING:
         controlled``).
 
-        The arrays are derived as in :meth:`integerize`; the LP is that of
-        :mod:`populationsim.integerizing.controlled_rounding` (targets, bands,
-        prices) solved by
+        The arrays are derived as in :meth:`integerize`; the problem is that
+        of :mod:`populationsim.integerizing.controlled_rounding` (targets,
+        bands, prices). ``INTEGERIZER_CONTROLLED_METHOD`` chooses how it is
+        decided: ``search`` (default) by the network start and swap search
+        of :func:`populationsim.integerizing.controlled_search.solve_search`,
+        ``lp`` by the LP of
         :func:`populationsim.integerizing.controlled_lp.solve_controlled`
-        (solver, retry, repair); its result is then rounded per sub-zone by
-        ``smart_round`` exactly as upstream's LP result is. A failed solve
+        (solver, retry, repair). The result is then rounded per sub-zone by
+        ``smart_round`` exactly as upstream's LP result is. A failed call
         returns the input residuals and the failure status, so the wrapper's
         sequential path runs as after an upstream failure.
 
@@ -344,25 +351,40 @@ class SimulIntegerizer:
             bs_options.penalty_settings(),
         )
         timing = {}
-        resid_weights_out, status_text, stats = controlled_lp.solve_controlled(
-            problem,
-            sub_incidence,
-            parent_incidence,
-            sub_resid_weights,
-            total_hh_sub_control_index,
-            bs_options.controlled_solver(),
-            bs_options.controlled_retry_solver(),
-            bs_options.controlled_repair(),
-            self.timeout_in_seconds,
-            timing=timing,
-        )
-        # solve_s of the record: the LP attempts plus the repair and its
-        # pricing solve
-        if "solve_s" in timing:
-            timing["solve_s"] += stats.get("repair_seconds", 0.0) + stats.get(
-                "objective_seconds", 0.0
+        if bs_options.controlled_method() == "lp":
+            resid_weights_out, status_text, stats = controlled_lp.solve_controlled(
+                problem,
+                sub_incidence,
+                parent_incidence,
+                sub_resid_weights,
+                total_hh_sub_control_index,
+                bs_options.controlled_solver(),
+                bs_options.controlled_retry_solver(),
+                bs_options.controlled_repair(),
+                self.timeout_in_seconds,
+                timing=timing,
             )
-        _log_controlled_call(self.trace_label, status_text, stats)
+            stats = dict(stats, method="lp")
+            # solve_s of the record: the LP attempts plus the repair and its
+            # pricing solve
+            if "solve_s" in timing:
+                timing["solve_s"] += stats.get("repair_seconds", 0.0) + stats.get(
+                    "objective_seconds", 0.0
+                )
+            _log_controlled_call(self.trace_label, status_text, stats)
+        else:
+            search = bs_options.search_settings()
+            resid_weights_out, status_text, stats = controlled_search.solve_search(
+                problem,
+                sub_incidence,
+                keys,
+                sub_resid_weights,
+                total_hh_sub_control_index,
+                search.max_sweeps,
+                search.shortlist,
+                timing=timing,
+            )
+            _log_search_call(self.trace_label, status_text, stats)
 
         path_record.record_call(
             "simul",
@@ -445,6 +467,51 @@ def _log_controlled_call(trace_label, status_text, stats):
     if stats["fractional_after_repair"] > 0:
         reasons.append(
             "%d fractional values after the repair" % stats["fractional_after_repair"]
+        )
+    if stats["hh_unreachable"] > 0:
+        reasons.append("%d households unreachable" % stats["hh_unreachable"])
+    if reasons:
+        logger.warning("[simul controlled] %s: %s", trace_label, "; ".join(reasons))
+
+
+def _log_search_call(trace_label, status_text, stats):
+    """One INFO line per search call, and one WARNING when the call needs
+    attention (failed status, search stopped by ``max_sweeps``, a zone or row
+    shortfall of the start, households the household controls cannot
+    reach)."""
+    logger.info(
+        "[simul controlled] %s: method search, status %s, x %d, swaps %d, "
+        "sweeps %d, converged %d, distance %.9g -> %.9g, flow %d of %d, "
+        "zone shortfall %d, row shortfall %d",
+        trace_label,
+        status_text,
+        stats["x_count"],
+        stats["swaps"],
+        stats["sweeps"],
+        stats["converged"],
+        stats["distance_start"],
+        stats["distance_final"],
+        stats["flow_achieved"],
+        stats["flow_wanted"],
+        stats["zone_shortfall"],
+        stats["row_shortfall"],
+    )
+    reasons = []
+    if status_text not in STATUS_SUCCESS:
+        reasons.append("status %s (the wrapper's fallback runs)" % status_text)
+    elif not stats["converged"]:
+        reasons.append(
+            "not converged after %d sweeps (INTEGERIZER_SEARCH_MAX_SWEEPS)"
+            % stats["sweeps"]
+        )
+    if stats["zone_shortfall"] > 0:
+        reasons.append(
+            "zone shortfall %d (round-ups smart_round adds outside the search)"
+            % stats["zone_shortfall"]
+        )
+    if stats["row_shortfall"] > 0:
+        reasons.append(
+            "row shortfall %d (parent weight not placed)" % stats["row_shortfall"]
         )
     if stats["hh_unreachable"] > 0:
         reasons.append("%d households unreachable" % stats["hh_unreachable"])

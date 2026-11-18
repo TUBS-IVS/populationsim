@@ -288,9 +288,7 @@ def test_each_wrapper_branch_writes_its_outcome(
         return status, (_df("S") if isinstance(result, str) else result)
 
     monkeypatch.setattr(wrappers, "try_simul_integerizing", fake_try)
-    monkeypatch.setattr(
-        wrappers, "do_sequential_integerizing", lambda *a, **k: seq
-    )
+    monkeypatch.setattr(wrappers, "do_sequential_integerizing", lambda *a, **k: seq)
     wrappers.do_simul_integerizing(**_wrapper_inputs(zone_ids))
     assert not queue
     rows = _rows(settings["_record_path"])
@@ -441,7 +439,9 @@ def test_record_on_example(tmp_path):
     assert keys and len(keys) == len(set(keys))
     # every parent solved once (first simul call, not a retry) has its outcome
     parents = [
-        r for r in calls if r["kind"] == "simul" and not r["trace_label"].startswith("retry_")
+        r
+        for r in calls
+        if r["kind"] == "simul" and not r["trace_label"].startswith("retry_")
     ]
     assert len(keys) == len(parents)
     for geography in ("TRACT", "TAZ"):
@@ -501,9 +501,9 @@ def test_record_ignores_output_file_prefix(settings, monkeypatch, tmp_path):
         monkeypatch.setattr(
             config,
             "setting",
-            lambda key, default=None: True
-            if key == "INTEGERIZER_PATH_RECORD"
-            else default,
+            lambda key, default=None: (
+                True if key == "INTEGERIZER_PATH_RECORD" else default
+            ),
         )
         bs_options.reset_for_tests()
         path_record.record_outcome("simultaneous", geography="TAZ")
@@ -542,9 +542,72 @@ def test_round_mode_path_record_has_bs1_columns(settings):
     assert list(path_record.COLUMNS) == COLUMNS
 
 
-def test_controlled_path_record_columns_and_counts(settings):
+def test_controlled_columns_are_the_documented_tuple():
+    assert path_record.CONTROLLED_COLUMNS == tuple(COLUMNS) + (
+        "rounding",
+        "method",
+        "solver",
+        "attempts",
+        "x_count",
+        "swaps",
+        "sweeps",
+        "converged",
+        "distance_start",
+        "distance_final",
+        "flow_wanted",
+        "flow_achieved",
+        "zone_shortfall",
+        "row_shortfall",
+        "fractional_x",
+        "repaired_x",
+        "fractional_after_repair",
+        "repair_failed",
+        "slack_cell",
+        "slack_parent_sub",
+        "slack_parent",
+        "slack_conserve",
+        "hh_unreachable",
+        "hh_outside_lp",
+        "hh_excess",
+        "objective_lp",
+        "objective_repaired",
+    )
+
+
+# the columns only the LP method fills, and those only the search fills
+LP_ONLY_COLUMNS = (
+    "solver",
+    "attempts",
+    "fractional_x",
+    "repaired_x",
+    "fractional_after_repair",
+    "repair_failed",
+    "slack_cell",
+    "slack_parent_sub",
+    "slack_parent",
+    "slack_conserve",
+    "objective_lp",
+    "objective_repaired",
+)
+SEARCH_ONLY_COLUMNS = (
+    "swaps",
+    "sweeps",
+    "converged",
+    "distance_start",
+    "distance_final",
+    "flow_wanted",
+    "flow_achieved",
+    "zone_shortfall",
+    "row_shortfall",
+)
+
+
+@pytest.mark.parametrize("method", ["search", "lp", None])
+def test_controlled_path_record_columns_and_counts(settings, method):
     settings["INTEGERIZER_PATH_RECORD"] = True
     settings["INTEGERIZER_ROUNDING"] = "controlled"
+    if method is not None:
+        settings["INTEGERIZER_CONTROLLED_METHOD"] = method
     _single(label="s").integerize()
     _simul(zones=2, label="m").integerize()
     path_record.record_outcome("simultaneous", geography="TAZ", trace_label="m")
@@ -554,18 +617,76 @@ def test_controlled_path_record_columns_and_counts(settings):
     single, simul, outcome = _rows(settings["_record_path"])
     assert (single["kind"], single["rounding"]) == ("single", "round")
     assert single["solver"] == "" and single["x_count"] == ""
+    assert single["method"] == "" and single["swaps"] == ""
     assert (simul["kind"], simul["rounding"]) == ("simul", "controlled")
-    assert simul["status"] in ("OPTIMAL", "FEASIBLE")
-    assert simul["solver"] == bs_options.controlled_solver()
-    assert simul["attempts"] == "1"
-    for column in CONTROLLED_COUNTS:
-        assert int(simul[column]) >= 0, column
-    for column in ("slack_cell", "slack_parent_sub", "slack_parent", "slack_conserve"):
-        assert float(simul[column]) >= 0.0, column
-    assert float(simul["objective_lp"]) >= float(simul["objective_repaired"]) - 1e-6
     assert float(simul["build_s"]) >= 0 and float(simul["solve_s"]) >= 0
+    for column in ("x_count", "hh_unreachable", "hh_outside_lp", "hh_excess"):
+        assert int(simul[column]) >= 0, column
+    if method == "lp":
+        assert simul["method"] == "lp"
+        assert simul["status"] in ("OPTIMAL", "FEASIBLE")
+        assert simul["solver"] == bs_options.controlled_solver()
+        assert simul["attempts"] == "1"
+        for column in CONTROLLED_COUNTS:
+            assert int(simul[column]) >= 0, column
+        for column in (
+            "slack_cell",
+            "slack_parent_sub",
+            "slack_parent",
+            "slack_conserve",
+        ):
+            assert float(simul[column]) >= 0.0, column
+        assert float(simul["objective_lp"]) >= float(simul["objective_repaired"]) - 1e-6
+        assert all(simul[column] == "" for column in SEARCH_ONLY_COLUMNS)
+    else:
+        # the default method
+        assert simul["method"] == "search"
+        assert simul["status"] == "FEASIBLE"
+        for column in (
+            "swaps",
+            "sweeps",
+            "converged",
+            "flow_wanted",
+            "flow_achieved",
+            "zone_shortfall",
+            "row_shortfall",
+        ):
+            assert int(simul[column]) >= 0, column
+        assert simul["converged"] == "1"
+        assert float(simul["distance_final"]) <= float(simul["distance_start"])
+        assert all(simul[column] == "" for column in LP_ONLY_COLUMNS)
     assert (outcome["row_type"], outcome["rounding"]) == ("outcome", "controlled")
     assert outcome["solver"] == "" and outcome["attempts"] == ""
+    assert outcome["method"] == "" and outcome["swaps"] == ""
+
+
+def test_search_failure_is_recorded_and_handed_to_the_wrapper(
+    settings, monkeypatch, caplog
+):
+    from populationsim.integerizing import controlled_search
+
+    settings["INTEGERIZER_PATH_RECORD"] = True
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+
+    def failing(*args, **kwargs):
+        return "BAD_COST_RANGE", None
+
+    monkeypatch.setattr(controlled_search, "_min_cost_flow", failing)
+    with caplog.at_level(logging.WARNING):
+        assert _simul(zones=2, label="flowfail").integerize() == "ABNORMAL"
+    (row,) = _rows(settings["_record_path"])
+    assert (row["kind"], row["status"], row["method"]) == (
+        "simul",
+        "ABNORMAL",
+        "search",
+    )
+    assert row["swaps"] == "0" and row["distance_final"] == ""
+    assert any(
+        r.levelno == logging.WARNING
+        and "[simul controlled] flowfail" in r.getMessage()
+        and "status ABNORMAL" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def _stub_stats(**changes):
@@ -602,6 +723,7 @@ def test_path_record_counts_fractional_lp_values(settings, monkeypatch, caplog):
 
     settings["INTEGERIZER_PATH_RECORD"] = True
     settings["INTEGERIZER_ROUNDING"] = "controlled"
+    settings["INTEGERIZER_CONTROLLED_METHOD"] = "lp"
 
     def fractional(problem, sub_incidence, parent_incidence, resid, *args, **kwargs):
         out = np.zeros_like(resid)
@@ -648,6 +770,7 @@ def test_controlled_lp_failure_is_recorded_and_handed_to_the_wrapper(
 
     settings["INTEGERIZER_PATH_RECORD"] = True
     settings["INTEGERIZER_ROUNDING"] = "controlled"
+    settings["INTEGERIZER_CONTROLLED_METHOD"] = "lp"
     settings["INTEGERIZE_WITH_BACKSTOPPED_CONTROLS"] = False
 
     def not_solved(problem, sub_incidence, parent_incidence, resid, *args, **kwargs):

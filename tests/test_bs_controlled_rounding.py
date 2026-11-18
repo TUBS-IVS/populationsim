@@ -1524,9 +1524,12 @@ def _integer_weights(settings, mode, **extra):
 
 
 def test_round_mode_calls_upstream_lp_only(settings, monkeypatch):
+    from populationsim.integerizing import controlled_search
+
     calls = []
     upstream = lp_ortools.np_simul_integerizer_ortools
     controlled = controlled_lp.solve_controlled
+    search = controlled_search.solve_search
 
     def upstream_spy(*args, **kwargs):
         calls.append("upstream")
@@ -1536,17 +1539,35 @@ def test_round_mode_calls_upstream_lp_only(settings, monkeypatch):
         calls.append("controlled")
         return controlled(*args, **kwargs)
 
+    def search_spy(*args, **kwargs):
+        calls.append("search")
+        return search(*args, **kwargs)
+
     monkeypatch.setattr(lp_ortools, "np_simul_integerizer_ortools", upstream_spy)
     monkeypatch.setattr(controlled_lp, "solve_controlled", controlled_spy)
+    monkeypatch.setattr(controlled_search, "solve_search", search_spy)
     _integer_weights(settings, "round")
     assert calls == ["upstream"]
     calls.clear()
+    # the default controlled method is the search
     _integer_weights(settings, "controlled")
+    assert calls == ["search"]
+    calls.clear()
+    _integer_weights(settings, "controlled", INTEGERIZER_CONTROLLED_METHOD="lp")
     assert calls == ["controlled"]
 
 
-def test_controlled_integerizer_conserves_parent_weights(settings):
-    controlled = _integer_weights(settings, "controlled")
+# the methods of the controlled rounding; None = the default (search)
+METHODS = [None, "search", "lp"]
+
+
+def _method_settings(method):
+    return {} if method is None else {"INTEGERIZER_CONTROLLED_METHOD": method}
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_controlled_integerizer_conserves_parent_weights(settings, method):
+    controlled = _integer_weights(settings, "controlled", **_method_settings(method))
     incidence = np.array(list(_INCIDENCE.values()), dtype=np.int64).T
     np.testing.assert_array_equal(controlled.sum(axis=1), [1, 6, 5])
     np.testing.assert_array_equal(controlled.sum(axis=0), [3, 3, 3, 3])
@@ -1564,13 +1585,15 @@ def test_controlled_integerizer_conserves_parent_weights(settings):
     assert (upstream.T @ incidence)[:, 1].sum() == 0
 
 
-def test_controlled_with_draw_uses_the_call_generator(settings):
+@pytest.mark.parametrize("method", METHODS)
+def test_controlled_with_draw_uses_the_call_generator(settings, method):
     def draw(seed):
         return _integer_weights(
             settings,
             "controlled",
             INTEGERIZER_DRAW="pareto",
             INTEGERIZER_RANDOM_SEED=seed,
+            **_method_settings(method),
         )
 
     first = draw(1)
