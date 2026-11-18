@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import logging
 import subprocess
 
 import numpy as np
@@ -511,3 +512,175 @@ def test_record_ignores_output_file_prefix(settings, monkeypatch, tmp_path):
         bs_options.reset_for_tests()
     assert (out / "integerizer_paths.csv").exists()
     assert not list(out.glob("PREFIX*"))
+
+
+# --------------------------------------- INTEGERIZER_ROUNDING: controlled
+
+# the counts a controlled simultaneous call row carries (stats of
+# controlled_lp.solve_controlled)
+CONTROLLED_COUNTS = (
+    "attempts",
+    "x_count",
+    "fractional_x",
+    "repaired_x",
+    "fractional_after_repair",
+    "repair_failed",
+    "hh_unreachable",
+    "hh_outside_lp",
+    "hh_excess",
+)
+
+
+def test_round_mode_path_record_has_bs1_columns(settings):
+    settings["INTEGERIZER_PATH_RECORD"] = True
+    settings["INTEGERIZER_ROUNDING"] = "round"
+    _single(label="s").integerize()
+    _simul(zones=2, label="m").integerize()
+    path_record.record_outcome("simultaneous", geography="TAZ", trace_label="m")
+    header = settings["_record_path"].read_text().splitlines()[0]
+    assert tuple(header.split(",")) == path_record.COLUMNS
+    assert list(path_record.COLUMNS) == COLUMNS
+
+
+def test_controlled_path_record_columns_and_counts(settings):
+    settings["INTEGERIZER_PATH_RECORD"] = True
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    _single(label="s").integerize()
+    _simul(zones=2, label="m").integerize()
+    path_record.record_outcome("simultaneous", geography="TAZ", trace_label="m")
+    header = settings["_record_path"].read_text().splitlines()[0]
+    assert tuple(header.split(",")) == path_record.CONTROLLED_COLUMNS
+    assert path_record.CONTROLLED_COLUMNS[: len(COLUMNS)] == tuple(COLUMNS)
+    single, simul, outcome = _rows(settings["_record_path"])
+    assert (single["kind"], single["rounding"]) == ("single", "round")
+    assert single["solver"] == "" and single["x_count"] == ""
+    assert (simul["kind"], simul["rounding"]) == ("simul", "controlled")
+    assert simul["status"] in ("OPTIMAL", "FEASIBLE")
+    assert simul["solver"] == bs_options.controlled_solver()
+    assert simul["attempts"] == "1"
+    for column in CONTROLLED_COUNTS:
+        assert int(simul[column]) >= 0, column
+    for column in ("slack_cell", "slack_parent_sub", "slack_parent", "slack_conserve"):
+        assert float(simul[column]) >= 0.0, column
+    assert float(simul["objective_lp"]) >= float(simul["objective_repaired"]) - 1e-6
+    assert float(simul["build_s"]) >= 0 and float(simul["solve_s"]) >= 0
+    assert (outcome["row_type"], outcome["rounding"]) == ("outcome", "controlled")
+    assert outcome["solver"] == "" and outcome["attempts"] == ""
+
+
+def _stub_stats(**changes):
+    stats = {
+        "x_count": 0,
+        "fractional_x": 0,
+        "slack_cell": 0.0,
+        "slack_parent_sub": 0.0,
+        "slack_parent": 0.0,
+        "slack_conserve": 0.0,
+        "solver": "highs-ds",
+        "attempts": 1,
+        "repaired_x": 0,
+        "fractional_after_repair": 0,
+        "repair_failed": 0,
+        "repair_seconds": 0.0,
+        "conserve_deviation_lp": 0.0,
+        "conserve_deviation_repaired": 0.0,
+        "objective_lp": float("nan"),
+        "objective_repaired": float("nan"),
+        "objective_seconds": 0.0,
+        "hh_unreachable": 0,
+        "hh_outside_lp": 0,
+        "hh_excess": 0,
+    }
+    stats.update(changes)
+    return stats
+
+
+def test_path_record_counts_fractional_lp_values(settings, monkeypatch, caplog):
+    """A fractional LP solution: the count is recorded and warned about, and
+    smart_round still gives every zone its household control."""
+    from populationsim.integerizing import controlled_lp
+
+    settings["INTEGERIZER_PATH_RECORD"] = True
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+
+    def fractional(problem, sub_incidence, parent_incidence, resid, *args, **kwargs):
+        out = np.zeros_like(resid)
+        out[0, 0] = 0.5
+        out[1, 0] = 0.5
+        stats = _stub_stats(
+            x_count=int(problem.x_allowed.sum()),
+            fractional_x=2,
+            fractional_after_repair=2,
+            objective_lp=1.0,
+            objective_repaired=1.0,
+        )
+        return out, "OPTIMAL", stats
+
+    monkeypatch.setattr(controlled_lp, "solve_controlled", fractional)
+    integerizer = _simul(zones=2, label="frac")
+    with caplog.at_level(logging.INFO):
+        assert integerizer.integerize() == "OPTIMAL"
+    (row,) = _rows(settings["_record_path"])
+    assert row["rounding"] == "controlled"
+    assert (row["fractional_x"], row["fractional_after_repair"]) == ("2", "2")
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "[simul controlled]" in r.getMessage()
+    ]
+    assert len(warnings) == 1 and "frac" in warnings[0]
+    infos = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and "[simul controlled]" in r.getMessage()
+    ]
+    assert len(infos) == 1
+    controls = integerizer.sub_controls_df["num_hh"].to_numpy()
+    np.testing.assert_array_equal(
+        integerizer.integerized_weights.sum(axis=0).to_numpy(), controls
+    )
+
+
+def test_controlled_lp_failure_is_recorded_and_handed_to_the_wrapper(
+    settings, monkeypatch, caplog
+):
+    from populationsim.integerizing import controlled_lp
+
+    settings["INTEGERIZER_PATH_RECORD"] = True
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    settings["INTEGERIZE_WITH_BACKSTOPPED_CONTROLS"] = False
+
+    def not_solved(problem, sub_incidence, parent_incidence, resid, *args, **kwargs):
+        return resid, "NOT_SOLVED", _stub_stats(x_count=int(problem.x_allowed.sum()))
+
+    monkeypatch.setattr(controlled_lp, "solve_controlled", not_solved)
+    with caplog.at_level(logging.WARNING):
+        assert _simul(zones=2, label="fail").integerize() == "NOT_SOLVED"
+    (row,) = _rows(settings["_record_path"])
+    assert (row["kind"], row["status"], row["rounding"]) == (
+        "simul",
+        "NOT_SOLVED",
+        "controlled",
+    )
+    assert row["objective_lp"] == "" and row["objective_repaired"] == ""
+    assert any(
+        r.levelno == logging.WARNING and "[simul controlled] fail" in r.getMessage()
+        for r in caplog.records
+    )
+
+    settings["_record_path"].unlink()
+    inputs = _wrapper_inputs([1, 2])
+    inputs["control_spec"] = inputs["control_spec"].assign(seed_table="households")
+    wrappers.do_simul_integerizing(**inputs)
+    rows = _rows(settings["_record_path"])
+    simul_calls = [r for r in rows if r["row_type"] == "call" and r["kind"] == "simul"]
+    assert simul_calls and all(
+        (r["status"], r["rounding"]) == ("NOT_SOLVED", "controlled")
+        for r in simul_calls
+    )
+    single_calls = [r for r in rows if r["kind"] == "single"]
+    assert single_calls and all(r["rounding"] == "round" for r in single_calls)
+    outcomes = [r for r in rows if r["row_type"] == "outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["outcome"] in OUTCOMES - {"simultaneous", "retry_simultaneous"}
+    assert outcomes[0]["rounding"] == "controlled"

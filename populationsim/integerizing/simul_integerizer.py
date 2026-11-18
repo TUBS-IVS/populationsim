@@ -9,6 +9,8 @@ import pandas as pd
 from populationsim.core import config
 from populationsim.integerizing.smart_round import smart_round
 from populationsim.integerizing import bs_options, draw, lp_ortools, lp_cvx, path_record
+from populationsim.integerizing import controlled_lp, controlled_rounding
+from populationsim.integerizing.constants import STATUS_SUCCESS
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +71,17 @@ class SimulIntegerizer:
         # fork: INTEGERIZER_DRAW (off = upstream objective); OR-Tools only
         self.draw_method = draw.resolve_draw_method(use_cvxpy)
         self.use_cvxpy = bool(use_cvxpy)
+        # fork: INTEGERIZER_ROUNDING (round = upstream LP); OR-Tools only
+        self.rounding_mode = bs_options.resolve_rounding_mode(use_cvxpy)
         path_record.check_usable()
         bs_options.log_options_once()
 
     def integerize(self):
+
+        # fork: controlled rounding (INTEGERIZER_ROUNDING: controlled); with
+        # round the method below is upstream's, unchanged
+        if self.rounding_mode == "controlled":
+            return self._integerize_controlled()
 
         # - subzone
 
@@ -263,3 +272,181 @@ class SimulIntegerizer:
         )
 
         return status_text
+
+    def _integerize_controlled(self):
+        """Fork: integerize with the controlled rounding (``INTEGERIZER_ROUNDING:
+        controlled``).
+
+        The arrays are derived as in :meth:`integerize`; the LP is that of
+        :mod:`populationsim.integerizing.controlled_rounding` (targets, bands,
+        prices) solved by
+        :func:`populationsim.integerizing.controlled_lp.solve_controlled`
+        (solver, retry, repair); its result is then rounded per sub-zone by
+        ``smart_round`` exactly as upstream's LP result is. A failed solve
+        returns the input residuals and the failure status, so the wrapper's
+        sequential path runs as after an upstream failure.
+
+        The household keys are those of upstream's objective: the draw keys
+        (``INTEGERIZER_DRAW``) or else ``ln`` of the sub-zone residual (with
+        upstream's floor ``LOG_OVERFLOW``), plus ``ln`` of the row's summed
+        residual (upstream's parent term).
+        """
+        total_hh_sub_control_index = self.sub_controls_df.columns.get_loc(
+            self.total_hh_control_col
+        )
+
+        sub_incidence = self.incidence_df[self.sub_controls_df.columns]
+        sub_incidence = sub_incidence.values.astype(np.float64)
+
+        # (sub-zones, rows), as in integerize
+        sub_float_weights = self.sub_weights.values.transpose().astype(np.float64)
+        sub_int_weights = sub_float_weights.astype(int)
+        sub_resid_weights = sub_float_weights % 1.0
+
+        sub_control_totals = np.asanyarray(self.sub_controls_df).astype(np.int64)
+        sub_control_importance = np.asanyarray(self.sub_control_importance).astype(
+            np.float64
+        )
+        # the integer household control of each sub-zone (what smart_round meets)
+        total_household_controls = sub_control_totals[
+            :, total_hh_sub_control_index
+        ].flatten()
+
+        parent_incidence = self.incidence_df[self.parent_countrol_cols]
+        parent_incidence = parent_incidence.values.astype(np.float64)
+        parent_countrol_importance = np.asanyarray(
+            self.parent_countrol_importance
+        ).astype(np.float64)
+        parent_resid_weights = np.sum(sub_resid_weights, axis=0)
+
+        floor = np.exp(draw.LOG_OVERFLOW)
+        draw_keys = None
+        if self.draw_method != "off":
+            draw_keys = draw.draw_keys(
+                sub_resid_weights,
+                self.draw_method,
+                bs_options.call_rng("simul", self.trace_label),
+            )
+            sub_keys = draw_keys
+        else:
+            sub_keys = np.log(np.maximum(sub_resid_weights, floor))
+        keys = sub_keys + np.log(np.maximum(parent_resid_weights, floor))[None, :]
+
+        problem = controlled_rounding.build_problem(
+            sub_float_weights,
+            sub_incidence,
+            parent_incidence,
+            sub_control_importance,
+            parent_countrol_importance,
+            total_household_controls,
+            total_hh_sub_control_index,
+            keys,
+            bs_options.penalty_settings(),
+        )
+        timing = {}
+        resid_weights_out, status_text, stats = controlled_lp.solve_controlled(
+            problem,
+            sub_incidence,
+            parent_incidence,
+            sub_resid_weights,
+            total_hh_sub_control_index,
+            bs_options.controlled_solver(),
+            bs_options.controlled_retry_solver(),
+            bs_options.controlled_repair(),
+            self.timeout_in_seconds,
+            timing=timing,
+        )
+        # solve_s of the record: the LP attempts plus the repair and its
+        # pricing solve
+        if "solve_s" in timing:
+            timing["solve_s"] += stats.get("repair_seconds", 0.0) + stats.get(
+                "objective_seconds", 0.0
+            )
+        _log_controlled_call(self.trace_label, status_text, stats)
+
+        path_record.record_call(
+            "simul",
+            self.trace_label,
+            status_text,
+            zones=len(self.sub_weights.columns),
+            rows=len(self.incidence_df.index),
+            timing=timing,
+            extra=stats,
+        )
+
+        # smart round resid_weights_out for each sub_zone, as in integerize
+        integerized_weights = np.empty_like(sub_int_weights)
+        sub_zone_count = len(self.sub_weights.columns)
+        if draw_keys is not None:
+            round_values = draw.rounding_values(
+                resid_weights_out, sub_resid_weights, status_text
+            )
+        for i in range(sub_zone_count):
+            if draw_keys is None:
+                integerized_weights[i] = smart_round(
+                    sub_int_weights[i],
+                    resid_weights_out[i],
+                    total_household_controls[i],
+                )
+            else:
+                integerized_weights[i] = smart_round(
+                    sub_int_weights[i],
+                    round_values[i],
+                    total_household_controls[i],
+                    tie_keys=draw_keys[i],
+                )
+
+        self.integerized_weights = pd.DataFrame(
+            data=integerized_weights.T,
+            columns=self.sub_weights.columns,
+            index=self.incidence_df.index,
+        )
+
+        return status_text
+
+
+def _share(count, total):
+    return 100.0 * count / total if total else 0.0
+
+
+def _log_controlled_call(trace_label, status_text, stats):
+    """One INFO line per controlled call, and one WARNING when the call needs
+    attention (failed status, a retry, a failed repair, fractional values left
+    after the repair, households the household controls cannot reach)."""
+    x_count = stats["x_count"]
+    logger.info(
+        "[simul controlled] %s: status %s, solver %s, attempts %d, x %d, "
+        "fractional %d (%.2f%%) before and %d (%.2f%%) after the repair, "
+        "slack cell %.6g, parent_sub %.6g, parent %.6g, conserve %.6g, "
+        "objective lp %.9g, repaired %.9g",
+        trace_label,
+        status_text,
+        stats["solver"],
+        stats["attempts"],
+        x_count,
+        stats["fractional_x"],
+        _share(stats["fractional_x"], x_count),
+        stats["fractional_after_repair"],
+        _share(stats["fractional_after_repair"], x_count),
+        stats["slack_cell"],
+        stats["slack_parent_sub"],
+        stats["slack_parent"],
+        stats["slack_conserve"],
+        stats["objective_lp"],
+        stats["objective_repaired"],
+    )
+    reasons = []
+    if status_text not in STATUS_SUCCESS:
+        reasons.append("status %s (the wrapper's fallback runs)" % status_text)
+    if stats["attempts"] > 1:
+        reasons.append("%d solver attempts" % stats["attempts"])
+    if stats["repair_failed"]:
+        reasons.append("repair failed")
+    if stats["fractional_after_repair"] > 0:
+        reasons.append(
+            "%d fractional values after the repair" % stats["fractional_after_repair"]
+        )
+    if stats["hh_unreachable"] > 0:
+        reasons.append("%d households unreachable" % stats["hh_unreachable"])
+    if reasons:
+        logger.warning("[simul controlled] %s: %s", trace_label, "; ".join(reasons))

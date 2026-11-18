@@ -1448,3 +1448,133 @@ def test_integrality_loss_is_reported(seed):
         assert stats["repaired_x"] > 0
     for name in ("hh_unreachable", "hh_outside_lp", "hh_excess"):
         assert stats[name] == getattr(problem, name)
+
+
+# --- the simultaneous integerizer in controlled mode ------------------------
+
+
+@pytest.fixture
+def settings(monkeypatch):
+    """Inject a settings dict (path record off)."""
+    from populationsim.core import config
+    from populationsim.integerizing import bs_options, path_record
+
+    values = {}
+    monkeypatch.setattr(
+        config, "setting", lambda key, default=None: values.get(key, default)
+    )
+    bs_options.reset_for_tests()
+    path_record.reset_for_tests()
+    yield values
+    bs_options.reset_for_tests()
+    path_record.reset_for_tests()
+
+
+# columns: household total, a rare group, kind_a (sub controls) and kind_b
+# (parent control). Four zones of three households each; row 0 is the rare
+# group with parent weight 1 spread evenly (0.25 per zone), rows 1 and 2 have
+# parent weights 6 and 5.
+_ZONE_IDS = [11, 12, 13, 14]
+_WEIGHTS = np.array(
+    [
+        [0.25, 0.25, 0.25, 0.25],
+        [1.4, 1.2, 1.6, 1.8],
+        [1.35, 1.55, 1.15, 0.95],
+    ]
+)
+_INCIDENCE = {
+    "num_hh": [1, 1, 1],
+    "rare": [1, 0, 0],
+    "kind_a": [0, 1, 0],
+    "kind_b": [0, 0, 1],
+}
+
+
+def _simul_integerizer(label="PUMA_1"):
+    import pandas as pd
+
+    from populationsim.integerizing.simul_integerizer import SimulIntegerizer
+
+    index = pd.RangeIndex(3, name="hh_id")
+    incidence = pd.DataFrame(_INCIDENCE, index=index)
+    sub_weights = pd.DataFrame(_WEIGHTS, index=index, columns=_ZONE_IDS)
+    float_totals = _WEIGHTS.T @ incidence.to_numpy(dtype=np.float64)
+    sub_controls = pd.DataFrame(
+        np.round(float_totals[:, :3]).astype(np.int64),
+        index=_ZONE_IDS,
+        columns=["num_hh", "rare", "kind_a"],
+    )
+    spec = pd.DataFrame(
+        {
+            "target": list(_INCIDENCE),
+            "importance": [1e9, 1000.0, 1000.0, 1000.0],
+        }
+    )
+    return SimulIntegerizer(incidence, sub_weights, sub_controls, spec, "num_hh", label)
+
+
+def _integer_weights(settings, mode, **extra):
+    settings["INTEGERIZER_ROUNDING"] = mode
+    settings.update(extra)
+    integerizer = _simul_integerizer()
+    status = integerizer.integerize()
+    assert status in STATUS_SUCCESS
+    # (rows, zones)
+    return integerizer.integerized_weights.to_numpy()
+
+
+def test_round_mode_calls_upstream_lp_only(settings, monkeypatch):
+    calls = []
+    upstream = lp_ortools.np_simul_integerizer_ortools
+    controlled = controlled_lp.solve_controlled
+
+    def upstream_spy(*args, **kwargs):
+        calls.append("upstream")
+        return upstream(*args, **kwargs)
+
+    def controlled_spy(*args, **kwargs):
+        calls.append("controlled")
+        return controlled(*args, **kwargs)
+
+    monkeypatch.setattr(lp_ortools, "np_simul_integerizer_ortools", upstream_spy)
+    monkeypatch.setattr(controlled_lp, "solve_controlled", controlled_spy)
+    _integer_weights(settings, "round")
+    assert calls == ["upstream"]
+    calls.clear()
+    _integer_weights(settings, "controlled")
+    assert calls == ["controlled"]
+
+
+def test_controlled_integerizer_conserves_parent_weights(settings):
+    controlled = _integer_weights(settings, "controlled")
+    incidence = np.array(list(_INCIDENCE.values()), dtype=np.int64).T
+    np.testing.assert_array_equal(controlled.sum(axis=1), [1, 6, 5])
+    np.testing.assert_array_equal(controlled.sum(axis=0), [3, 3, 3, 3])
+    float_totals = (_WEIGHTS.T @ incidence).sum(axis=0)
+    np.testing.assert_allclose(float_totals, [12.0, 1.0, 6.0, 5.0])
+    # the integer totals over the zones equal the float totals (up to float noise)
+    np.testing.assert_allclose(
+        (controlled.T @ incidence).sum(axis=0), float_totals, rtol=0, atol=1e-9
+    )
+
+    # contrast: upstream rounds the rare group's cell targets (0.25) to 0 in
+    # every zone and loses it
+    upstream = _integer_weights(settings, "round")
+    np.testing.assert_array_equal(upstream.sum(axis=0), [3, 3, 3, 3])
+    assert (upstream.T @ incidence)[:, 1].sum() == 0
+
+
+def test_controlled_with_draw_uses_the_call_generator(settings):
+    def draw(seed):
+        return _integer_weights(
+            settings,
+            "controlled",
+            INTEGERIZER_DRAW="pareto",
+            INTEGERIZER_RANDOM_SEED=seed,
+        )
+
+    first = draw(1)
+    np.testing.assert_array_equal(first, draw(1))
+    np.testing.assert_array_equal(first.sum(axis=1), [1, 6, 5])
+    outcomes = {draw(seed).tobytes() for seed in range(1, 11)}
+    assert len(outcomes) > 1
