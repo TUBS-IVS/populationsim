@@ -1,3 +1,5 @@
+# PopulationSim
+# See full license in LICENSE.txt.
 """Give the step-driving tests their own settings, whatever ran before.
 
 ``populationsim.core.config.setting`` reads the orca injectable ``settings``,

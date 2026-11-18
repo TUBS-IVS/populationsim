@@ -253,12 +253,19 @@ def np_simul_balancer_numba(
 # a zone and control (simultaneous) is known, the kernel computes the factor
 # once per distinct value and the update loop looks it up.
 #
-# Why the weights are identical bit for bit: every factor is the same
-# floating-point number as in the original (the same product of the same two
-# float64 numbers, passed to the same exp function); the multiplication, the
-# clip and the store are per element; no weight depends on the order of a sum
-# inside the update loop. The xx / yy reductions, the relaxation factors, the
-# rescale and the loop order are copied unchanged.
+# Why the weights are expected to be identical bit for bit: every factor is the
+# same floating-point number as in the original (the same product of the same
+# two float64 numbers, passed to the same exp function); the multiplication,
+# the clip and the store are per element; no weight depends on the order of a
+# sum inside the update loop. The xx / yy reductions, the relaxation factors,
+# the rescale and the loop order are copied unchanged.
+#
+# This argument is not a proof: the kernels are compiled with fastmath, which
+# lets LLVM reassociate and fuse floating-point operations and replace the exp
+# call. That the fast kernels reproduce the original ones bit for bit is
+# therefore a tested property of an environment (numba and LLVM version, CPU),
+# not one that holds by construction. Run tests/test_bs_balancer_fast_path.py in
+# the environment and on the machine type that is used.
 #
 # What can differ is the association of the delta sum: LLVM may vectorise the
 # new update loop differently. delta only decides convergence (delta below
@@ -311,6 +318,7 @@ _FAST_PATH_STATE = {
     "fallback_events": 0,
     "first_call_logged": set(),
     "atexit_registered": False,
+    "svml_unknown_logged": False,
 }
 
 _ENCODE_OK = 0
@@ -337,6 +345,7 @@ def reset_fast_path_counts():
             counts[outcome] = 0
     _FAST_PATH_STATE["fallback_events"] = 0
     _FAST_PATH_STATE["first_call_logged"] = set()
+    _FAST_PATH_STATE["svml_unknown_logged"] = False
 
 
 def log_fast_path_rate(logger=None):
@@ -422,9 +431,26 @@ def log_kernel_choice_once(use_numba):
 
 
 def _svml_active():
+    """Whether numba's SVML vector maths is active (the fast kernel is then not
+    used, see the comment above).
+
+    Fails closed: a numba without ``config.USING_SVML`` counts as SVML active, so
+    the original kernel runs (counted as ``fallback_svml``) instead of the fast
+    kernel running uncounted; this is logged once per process.
+    """
     import numba
 
-    return bool(getattr(numba.config, "USING_SVML", False))
+    value = getattr(numba.config, "USING_SVML", None)
+    if value is None:
+        if not _FAST_PATH_STATE["svml_unknown_logged"]:
+            _FAST_PATH_STATE["svml_unknown_logged"] = True
+            logger.warning(
+                "FAST_PATHS: this numba has no config.USING_SVML, so SVML is "
+                "treated as active and every balancer call runs the original "
+                "kernel (counted as fallback_svml)"
+            )
+        return True
+    return bool(value)
 
 
 def _log_first_call(kind, kernel_name):

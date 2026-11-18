@@ -453,6 +453,34 @@ def test_svml_runs_the_original_kernel(monkeypatch):
     assert _only_outcome("single") == "fallback_svml"
 
 
+def test_numba_without_the_svml_flag_fails_closed(monkeypatch, caplog, fork_logging):
+    """A numba whose config has no USING_SVML counts as SVML active: the
+    original kernel runs (counted as fallback_svml), and it is logged once."""
+    import types
+
+    import numba
+
+    monkeypatch.setattr(numba, "config", types.SimpleNamespace())
+    assert not hasattr(numba.config, "USING_SVML")
+    args = _single_problem(3, 300)
+    with caplog.at_level(logging.WARNING, logger=balancers_numba.__name__):
+        fast = np_balancer_numba_fast(*_copy_args(args))
+        np_balancer_numba_fast(*_copy_args(args))
+    orig = np_balancer_numba(*_copy_args(args))
+    _assert_same_result(orig, fast)
+    counts = fast_path_counts()["single"]
+    assert counts["fallback_svml"] == 2 and counts["fast"] == 0
+    warnings = [
+        r.getMessage() for r in caplog.records if "USING_SVML" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    # a numba that reports the flag is used as before
+    monkeypatch.setattr(numba, "config", types.SimpleNamespace(USING_SVML=False))
+    assert balancers_numba._svml_active() is False
+    monkeypatch.setattr(numba, "config", types.SimpleNamespace(USING_SVML=True))
+    assert balancers_numba._svml_active() is True
+
+
 @pytest.mark.parametrize("seed", [2, 3, 4, 7])
 def test_delta_band_reruns_the_original_kernel(monkeypatch, caplog, fork_logging, seed):
     """A band wide enough to hold every delta forces the re-run on every call."""

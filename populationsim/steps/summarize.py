@@ -74,7 +74,9 @@ class _DenseLayout:
 def _zero_filled_by_household(hh_weights, households):
     """Fork: one row per household of ``households`` (sorted, as ``groupby`` gives
     them), zero where none was stored; ``households`` are those the dense table
-    held (:class:`_DenseLayout`)."""
+    held (:class:`_DenseLayout`). Float sums over fewer rows can differ from the dense ones in the last
+    bits: pandas' grouped sum is compensated, so dropping zero rows can change
+    the last bit."""
     full = pd.Index(np.sort(np.asarray(households)), name=hh_weights.index.name)
     return hh_weights.reindex(full, fill_value=0)
 
@@ -85,7 +87,9 @@ def _zero_filled_aggregate(aggregate, incidence_df, layout, hh_id_col):
     them; zeros where no row was stored).
 
     ``aggregate`` is ``weights_df.groupby([seed, hh], as_index=False).sum()`` of a
-    positive-row table.
+    positive-row table. Float sums over fewer rows can differ from the dense ones in the last
+    bits: pandas' grouped sum is compensated, so dropping zero rows can change
+    the last bit.
     """
     seed_geography = layout.seed_geography
     keys = pd.DataFrame(
@@ -109,7 +113,9 @@ def _zero_filled_zones(summary_df, zone_ids, dense_zone_ids):
     as ``groupby`` gives them), zero where no row was stored.
 
     If the dense table held none of them, ``summary_df`` is returned unchanged
-    (the step's own all-empty case).
+    (the step's own all-empty case). Float sums over fewer rows can differ from the dense ones in the last
+    bits: pandas' grouped sum is compensated, so dropping zero rows can change
+    the last bit.
     """
     zones = np.intersect1d(np.asarray(zone_ids), np.asarray(dense_zone_ids))
     if len(zones) == 0:
@@ -304,9 +310,13 @@ def summarize(crosswalk, incidence_table, control_spec):
 
     Fork: with ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` the sub-geography weight tables
     hold only their positive rows; the step fills zeros for the households and
-    zones the dense table held (:class:`_DenseLayout`), so every summary table
-    equals the one of a run with the setting off: a zero term adds nothing to a
-    sum, and a household or zone that was never balanced stays missing. In repop
+    zones the dense table held (:class:`_DenseLayout`), so the summary tables have
+    the rows and columns of a run with the setting off and a household or zone
+    that was never balanced stays missing. A zero term adds nothing to an exact
+    sum, but pandas' grouped sum is compensated, so dropping the zero rows can
+    change the last bit of a float sum: the summary tables can differ from those
+    of a run with the setting off in the last bits of float sums (equal in the
+    example). ``expanded_household_ids`` and the ``_sparse`` tables are equal. In repop
     mode no zeros are filled: the lowest table is rebuilt dense by
     ``repop_balancing``, and the tables above it are only summed in the meta
     summary, where pandas sums a missing value as zero.

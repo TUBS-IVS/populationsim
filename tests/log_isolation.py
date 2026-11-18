@@ -1,3 +1,5 @@
+# PopulationSim
+# See full license in LICENSE.txt.
 """Keep the log tests of the fork independent of the test order.
 
 ``populationsim.core.tracing.config_logger`` (called by the pipeline and by

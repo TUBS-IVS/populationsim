@@ -296,6 +296,38 @@ def test_dispatch(settings, fast, cvxpy, expected):
     assert _integerizer().integerizer_func is expected
 
 
+def test_cvxpy_with_fast_paths_logs_that_the_fast_build_does_not_apply(
+    settings, caplog, fork_logging
+):
+    import logging
+
+    from populationsim.integerizing import single_integerizer
+
+    settings[SETTING] = True
+    settings["USE_CVXPY"] = True
+    single_integerizer._LOGGED_FAST_BUILD_SKIPPED.clear()
+    with caplog.at_level(logging.INFO, logger=single_integerizer.logger.name):
+        _integerizer()
+        _integerizer()
+    messages = [
+        r.getMessage() for r in caplog.records if "FAST_PATHS" in r.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "USE_CVXPY" in messages[0]
+
+    # no message without FAST_PATHS, none for the OR-Tools solver
+    single_integerizer._LOGGED_FAST_BUILD_SKIPPED.clear()
+    caplog.clear()
+    settings[SETTING] = False
+    with caplog.at_level(logging.INFO, logger=single_integerizer.logger.name):
+        _integerizer()
+    settings[SETTING] = True
+    settings["USE_CVXPY"] = False
+    with caplog.at_level(logging.INFO, logger=single_integerizer.logger.name):
+        _integerizer()
+    assert not [r for r in caplog.records if "FAST_PATHS" in r.getMessage()]
+
+
 # --- B. household expansion ---------------------------------------------------
 
 GEOGRAPHIES = ["REGION", "PUMA", "TAZ"]
@@ -434,6 +466,39 @@ def test_expansion_fast_lists_equal_upstream_lists():
         assert [type(p) for p in probs] == [type(p) for p in upstream[group_id][1]]
 
 
+def _lists(household_groups, used):
+    lists = eh.household_lists_for_groups(household_groups, used, "hh_id")
+    return {int(group_id): value for group_id, value in lists.items()}
+
+
+@pytest.mark.parametrize("dtype", [object, np.float64, np.int32])
+def test_expansion_lists_do_not_depend_on_the_dtype_of_the_used_ids(dtype):
+    """The step hands over an object array of group ids (the expanded table is
+    built from mixed dtypes); object, float and int ids select the same groups
+    and give the same lists as int64 ids."""
+    household_groups, weights = _expansion_tables(300, 30, seed=3)
+    used = weights["hh_id"].to_numpy()
+    expected = _lists(household_groups, used)
+    assert len(expected) > 0
+    got = _lists(household_groups, used.astype(dtype))
+    assert list(got) == list(expected)
+    for group_id, (ids, probs) in expected.items():
+        assert got[group_id][0] == ids
+        assert np.array_equal(np.array(got[group_id][1]), np.array(probs))
+
+
+def test_expansion_refuses_a_group_id_the_cast_would_change():
+    household_groups, weights = _expansion_tables(100, 10, seed=4)
+    used = weights["hh_id"].to_numpy().astype(np.float64)
+    used[0] = 2.5
+    with pytest.raises(ValueError, match="group id"):
+        eh.household_lists_for_groups(household_groups, used, "hh_id")
+    with pytest.raises(ValueError, match="group id"):
+        eh.household_lists_for_groups(
+            household_groups, np.array([1, "x"], dtype=object), "hh_id"
+        )
+
+
 def test_expansion_without_grouping_is_unchanged(monkeypatch):
     household_groups, weights = _expansion_tables(200, 20, seed=9)
     off, off_rng = _run_expand(
@@ -469,18 +534,25 @@ def _final_tables(path):
         return tables
 
 
-@pytest.mark.parametrize("variant", list(VARIANTS))
-def test_example_on_equals_off(tmp_path, variant):
-    overrides = VARIANTS[variant]
-    off_ids = run_example(REPO_ROOT, tmp_path / "off", {**overrides, SETTING: False})
-    on_ids = run_example(REPO_ROOT, tmp_path / "on", {**overrides, SETTING: True})
-    assert len(off_ids) > 0
+def _assert_example_equal(tmp_path, off_settings, on_settings, expect_ids=True):
+    """Run the example with ``off_settings`` and ``on_settings`` and compare the
+    expanded household ids and every weight, sparse and id table exactly."""
+    off_ids = run_example(
+        REPO_ROOT, tmp_path / "off", off_settings, allow_empty=not expect_ids
+    )
+    on_ids = run_example(
+        REPO_ROOT, tmp_path / "on", on_settings, allow_empty=not expect_ids
+    )
+    if expect_ids:
+        assert len(off_ids) > 0
     pd.testing.assert_frame_equal(on_ids, off_ids, check_exact=True)
 
     off_tables = _final_tables(tmp_path / "off" / "pipeline.h5")
     on_tables = _final_tables(tmp_path / "on" / "pipeline.h5")
-    assert "expanded_household_ids" in off_tables
+    if expect_ids:
+        assert "expanded_household_ids" in off_tables
     assert sorted(on_tables) == sorted(off_tables)
+    compared = 0
     for name in off_tables:
         if (
             name.endswith("_weights")
@@ -488,3 +560,55 @@ def test_example_on_equals_off(tmp_path, variant):
             or (name == "expanded_household_ids")
         ):
             _assert_same_table(on_tables[name], off_tables[name])
+            compared += 1
+    assert compared > 0
+
+
+@pytest.mark.parametrize("variant", list(VARIANTS))
+def test_example_on_equals_off(tmp_path, variant):
+    overrides = VARIANTS[variant]
+    _assert_example_equal(
+        tmp_path, {**overrides, SETTING: False}, {**overrides, SETTING: True}
+    )
+
+
+# The example configs leave USE_NUMBA off, so the runs above never reach the
+# lookup-table kernels of the balancers. These runs switch numba on in both
+# runs; the fast kernels are used on the "on" side only.
+NUMBA_VARIANTS = {
+    "default": {},
+    "sequential": {"USE_SIMUL_INTEGERIZER": False},
+    "no_integerization": {"NO_INTEGERIZATION_EVER": True},
+    "no_grouping": {"GROUP_BY_INCIDENCE_SIGNATURE": False},
+    "float_seed_weights": {"SUB_BALANCE_WITH_FLOAT_SEED_WEIGHTS": True},
+}
+
+
+@pytest.mark.parametrize("variant", list(NUMBA_VARIANTS))
+def test_example_with_numba_on_equals_off(tmp_path, variant):
+    overrides = {**NUMBA_VARIANTS[variant], "USE_NUMBA": True}
+    _assert_example_equal(
+        tmp_path,
+        {**overrides, SETTING: False},
+        {**overrides, SETTING: True},
+        expect_ids=variant != "no_integerization",
+    )
+
+
+def test_example_with_numba_and_both_run_time_options_equals_both_off(tmp_path):
+    """Numba on, FAST_PATHS and STORE_POSITIVE_WEIGHT_ROWS_ONLY together against
+    both off: the expanded household ids and the sparse tables are equal (the
+    weight tables of the positive-rows option hold fewer rows by design)."""
+    off = {"USE_NUMBA": True, SETTING: False, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": False}
+    on = {"USE_NUMBA": True, SETTING: True, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": True}
+    off_ids = run_example(REPO_ROOT, tmp_path / "off", off)
+    on_ids = run_example(REPO_ROOT, tmp_path / "on", on)
+    assert len(off_ids) > 0
+    pd.testing.assert_frame_equal(on_ids, off_ids, check_exact=True)
+    off_tables = _final_tables(tmp_path / "off" / "pipeline.h5")
+    on_tables = _final_tables(tmp_path / "on" / "pipeline.h5")
+    assert sorted(on_tables) == sorted(off_tables)
+    sparse = [name for name in off_tables if name.endswith("_sparse")]
+    assert sparse
+    for name in sparse + ["expanded_household_ids"]:
+        _assert_same_table(on_tables[name], off_tables[name])

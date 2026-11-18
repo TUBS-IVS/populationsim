@@ -35,7 +35,13 @@ def household_lists_for_groups(household_groups, group_ids, household_id_col):
     household_groups : pandas.DataFrame
         columns ``household_id_col``, ``group_id``, ``sample_weight``
     group_ids : array-like
-        group ids that occur in the expanded weights (any order, repeats allowed)
+        group ids that occur in the expanded weights (any order, repeats allowed).
+        The step hands over an object array (the expanded table is built from
+        values of mixed dtype); ``np.isin`` of such an array against the integer
+        group column compares element by element (65 s for 7,707 used groups
+        against 218,097 rows, 0.002 s after a cast), so the used ids are cast to
+        the dtype of the ``group_id`` column first. A ``ValueError`` is raised if
+        the cast changes a value (a non-integral or non-numeric id).
     household_id_col : str
 
     Returns
@@ -45,6 +51,19 @@ def household_lists_for_groups(household_groups, group_ids, household_id_col):
     """
     group_col = household_groups["group_id"].to_numpy()
     used = pd.unique(np.asarray(group_ids))
+    try:
+        converted = used.astype(group_col.dtype)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "expand_households: group ids cannot be cast to the dtype %s of the "
+            "group_id column (%s)" % (group_col.dtype, error)
+        ) from error
+    if not np.array_equal(converted, used):
+        raise ValueError(
+            "expand_households: the cast of the used group ids to the dtype %s of "
+            "the group_id column changes a group id value" % group_col.dtype
+        )
+    used = converted
     rows = np.flatnonzero(np.isin(group_col, used))
     order = rows[np.argsort(group_col[rows], kind="stable")]
     sorted_groups = group_col[order]

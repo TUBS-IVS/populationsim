@@ -261,7 +261,7 @@ def test_rebuild_refuses_households_of_another_seed_zone():
     seed_index, dense = _dense_parent_table()
     stored = pwr.keep_positive_rows(dense, 1)
     stored.loc[stored["hh_id"] == 35, "hh_id"] = 99
-    with pytest.raises(AssertionError, match="overlapping zones"):
+    with pytest.raises(ValueError, match="overlapping zones"):
         pwr.rebuild_parent_weights(
             stored[stored["TRACT"] == 1], "hh_id", "balanced_weight", seed_index
         )
@@ -458,6 +458,39 @@ def test_sub_balancing_on_refuses_a_parent_without_stored_rows(
         _run_sub_balancing(monkeypatch, settings, problem, False)
     with pytest.raises(RuntimeError, match=r"TAZ.*TRACT %d\b" % missing):
         _run_sub_balancing(monkeypatch, settings, problem, True)
+
+
+def test_sub_balancing_off_refuses_a_table_stored_with_the_setting_on(
+    monkeypatch, settings
+):
+    """Resuming with the setting off a run that stored positive rows only: the
+    step names the setting instead of upstream's crosswalk assertion."""
+    problem = _sub_balancing_problem(
+        {10: [2.0, 1.5, 0.0, 3.0, 1.0, 0.5], 11: [1.0, 0.0, 0.0, 2.0, 0.0, 1.0]}
+    )
+    stored = pwr.concat_kept(
+        [pwr.keep_positive_rows(g, t) for t, g in problem[4].groupby("TRACT")]
+    )
+    assert len(stored) < len(problem[4])
+    with pytest.raises(ValueError, match="STORE_POSITIVE_WEIGHT_ROWS_ONLY"):
+        _run_sub_balancing(monkeypatch, settings, problem, False, stored=stored)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"USE_SIMUL_INTEGERIZER": False}, {"NO_INTEGERIZATION_EVER": True}],
+    ids=["sequential", "no_integerizing"],
+)
+def test_sub_balancing_refuses_controlled_rounding_without_the_simul_integerizer(
+    monkeypatch, settings, extra
+):
+    problem = _sub_balancing_problem(
+        {10: [2.0, 1.5, 0.0, 3.0, 1.0, 0.5], 11: [1.0, 0.0, 0.0, 2.0, 0.0, 1.0]}
+    )
+    settings.update(extra)
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    with pytest.raises(ValueError, match="INTEGERIZER_ROUNDING"):
+        _run_sub_balancing(monkeypatch, settings, problem, False)
 
 
 # --- summarize --------------------------------------------------------------------

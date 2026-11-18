@@ -1,3 +1,5 @@
+# PopulationSim
+# See full license in LICENSE.txt.
 """Regression test: caplog must see fork log lines after the pipeline's logging setup."""
 
 from __future__ import annotations

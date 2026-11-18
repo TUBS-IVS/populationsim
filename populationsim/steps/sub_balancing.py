@@ -297,6 +297,26 @@ def sub_balancing(settings, crosswalk, control_spec, incidence_table):
                 else:
                     initial_weights = initial_weights["integer_weight"]
 
+                if parent_geography != seed_geography and len(
+                    initial_weights.index
+                ) < len(seed_incidence_df.index):
+                    # fork: a table stored with STORE_POSITIVE_WEIGHT_ROWS_ONLY on
+                    # and read with it off; upstream's assertion below would fire
+                    # with a message that names a crosswalk problem
+                    raise ValueError(
+                        "%s_weights has %d rows for %s %s, fewer than the %d rows of "
+                        "the seed table: the table was probably stored with "
+                        "STORE_POSITIVE_WEIGHT_ROWS_ONLY true and is read with it "
+                        "false; resume a run with the value it was started with"
+                        % (
+                            parent_geography,
+                            len(initial_weights.index),
+                            parent_geography,
+                            parent_id,
+                            len(seed_incidence_df.index),
+                        )
+                    )
+
             assert len(initial_weights.index) == len(
                 seed_incidence_df.index
             ), "seed table and initial weights table do not match, possibly due to overlapping zones in crosswalk."

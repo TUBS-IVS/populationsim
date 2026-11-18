@@ -27,6 +27,18 @@ BS1_OPTIONS = {
     "INTEGERIZER_RANDOM_SEED": 7,
     "INTEGERIZER_PATH_RECORD": True,
 }
+# the same without the draw: the upstream objective of both integerizers
+BS1_OPTIONS_DRAW_OFF = {
+    "KEEP_FRACTIONAL_SAMPLE_WEIGHTS": True,
+    "INTEGERIZER_PATH_RECORD": True,
+}
+# round mode against bs.1 in three settings; the example configs leave USE_NUMBA
+# off, so the third one runs the numba kernels on both sides
+BS1_VARIANTS = {
+    "draw_gumbel": BS1_OPTIONS,
+    "draw_off": BS1_OPTIONS_DRAW_OFF,
+    "numba": {**BS1_OPTIONS, "USE_NUMBA": True},
+}
 RUN_TIME_OPTIONS = {"STORE_POSITIVE_WEIGHT_ROWS_ONLY": True, "FAST_PATHS": True}
 RUN_TIME_OPTIONS_OFF = {"STORE_POSITIVE_WEIGHT_ROWS_ONLY": False, "FAST_PATHS": False}
 CONTROLLED = {**BS1_OPTIONS, "INTEGERIZER_ROUNDING": "controlled"}
@@ -54,14 +66,16 @@ def _assert_same_record(expected, actual):
     )
 
 
-@pytest.fixture(scope="module")
-def bs1_run(tmp_path_factory):
-    """The example on the code of the tag v0.10.0+bs.1."""
-    base = tmp_path_factory.mktemp("bs1")
+@pytest.fixture(scope="module", params=list(BS1_VARIANTS))
+def bs1_run(request, tmp_path_factory):
+    """The example on the code of the tag v0.10.0+bs.1 with the options of one
+    variant: (options, expanded ids, path record)."""
+    options = BS1_VARIANTS[request.param]
+    base = tmp_path_factory.mktemp("bs1_" + request.param)
     tag_root = export_tag(BS1_TAG, base / "tag_code")
     out = base / "out"
-    ids = run_example(tag_root, out, BS1_OPTIONS)
-    return ids, _read_record(out)
+    ids = run_example(tag_root, out, options)
+    return options, ids, _read_record(out)
 
 
 @pytest.fixture(scope="module")
@@ -79,23 +93,35 @@ def controlled_run(tmp_path_factory):
 
 
 def test_round_mode_equals_bs1(tmp_path, bs1_run):
-    """Round mode with the options of bs.1 gives bs.1's population and path record."""
-    bs1_ids, bs1_record = bs1_run
+    """Round mode with the options of bs.1 (draw on or off, numba on or off)
+    gives bs.1's population and path record."""
+    options, bs1_ids, bs1_record = bs1_run
     out = tmp_path / "out"
-    ids = run_example(REPO_ROOT, out, BS1_OPTIONS)
+    ids = run_example(REPO_ROOT, out, options)
     assert len(bs1_ids) > 0
     pd.testing.assert_frame_equal(ids, bs1_ids)  # row for row, no sorting
     _assert_same_record(bs1_record, _read_record(out))
 
 
 def test_run_options_do_not_change_round_mode(tmp_path, bs1_run):
-    """The run-time options of #656 leave round mode equal to bs.1."""
-    bs1_ids, bs1_record = bs1_run
+    """The run-time options of #656 leave round mode equal to bs.1, also with
+    numba on (the lookup-table kernels run) and with the draw off."""
+    options, bs1_ids, bs1_record = bs1_run
     out = tmp_path / "out"
-    ids = run_example(REPO_ROOT, out, {**BS1_OPTIONS, **RUN_TIME_OPTIONS})
+    ids = run_example(REPO_ROOT, out, {**options, **RUN_TIME_OPTIONS})
     assert len(bs1_ids) > 0
     pd.testing.assert_frame_equal(ids, bs1_ids)
     _assert_same_record(bs1_record, _read_record(out))
+
+
+def test_example_controlled_with_numba_options_on_equal_off(tmp_path):
+    """Controlled rounding with numba on: the run-time options do not change the
+    result (the lookup-table kernels run on the "on" side)."""
+    numba = {**CONTROLLED, "USE_NUMBA": True}
+    on = run_example(REPO_ROOT, tmp_path / "on", {**numba, **RUN_TIME_OPTIONS})
+    off = run_example(REPO_ROOT, tmp_path / "off", {**numba, **RUN_TIME_OPTIONS_OFF})
+    assert len(on) > 0
+    pd.testing.assert_frame_equal(on, off)
 
 
 def test_example_controlled_with_every_option_on(tmp_path, default_run, controlled_run):

@@ -20,6 +20,9 @@ from populationsim.integerizing import (
 
 logger = logging.getLogger(__name__)
 
+# fork: messages already logged, so that each is logged once per process
+_LOGGED_FAST_BUILD_SKIPPED = set()
+
 
 class Integerizer:
     def __init__(
@@ -65,6 +68,16 @@ class Integerizer:
         use_cvxpy = config.setting("USE_CVXPY", False)
         if use_cvxpy:
             self.integerizer_func = lp_cvx.np_integerizer_cvx
+            if bs_run_options.fast_paths():
+                # fork: the fast model build exists for OR-Tools only
+                message = (
+                    "FAST_PATHS: USE_CVXPY is on, so the single integerizer builds "
+                    "its CVXPY model as upstream does; the fast OR-Tools model "
+                    "build does not apply"
+                )
+                if message not in _LOGGED_FAST_BUILD_SKIPPED:
+                    _LOGGED_FAST_BUILD_SKIPPED.add(message)
+                    logger.info(message)
         elif bs_run_options.fast_paths():
             # fork: FAST_PATHS builds the same OR-Tools model from the non-zero
             # coefficients only (see lp_single_fast)

@@ -162,6 +162,11 @@ def rebuild_parent_weights(
         balance), and otherwise the stored table does not match the parent ids
         (for example a key or dtype mismatch). An all-zero vector would hide
         either.
+    ValueError
+        if the stored rows are not unique by ``household_id_col``, or a stored
+        household is not in ``order`` (it does not belong to the parent's seed
+        zone, possibly overlapping zones in the crosswalk). A ``ValueError``
+        and not an assertion, so that it also holds under ``python -O``.
     """
     if len(parent_rows.index) == 0:
         raise RuntimeError(
@@ -180,11 +185,13 @@ def rebuild_parent_weights(
     order = pd.Index(order, name=household_id_col)
     # every stored household must belong to the parent's seed zone; this takes the
     # place of upstream's length assertion, which a positive-row slice cannot meet
-    # (the message is upstream's)
-    assert weights.index.isin(order).all(), (
-        "seed table and initial weights table do not match, "
-        "possibly due to overlapping zones in crosswalk."
-    )
+    # (the message is upstream's); a ValueError, not an assert, so that the
+    # check also holds under ``python -O``
+    if not weights.index.isin(order).all():
+        raise ValueError(
+            "seed table and initial weights table do not match, "
+            "possibly due to overlapping zones in crosswalk."
+        )
     return weights.reindex(order, fill_value=0)
 
 

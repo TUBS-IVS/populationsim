@@ -122,7 +122,10 @@ Both default to `false` and neither changes the synthetic population: `expanded_
 row to that of a run with the option off. The tests that show it: `test_example_on_equals_off` in
 `tests/test_bs_positive_weight_rows.py` and in `tests/test_bs_fast_paths.py`, and
 `test_run_options_do_not_change_round_mode` and `test_example_controlled_with_every_option_on` in
-`tests/test_bs_release_equivalence.py`.
+`tests/test_bs_release_equivalence.py`. The example configs leave `USE_NUMBA` off, so the numba kernels are
+compared by `test_example_with_numba_on_equals_off` and
+`test_example_with_numba_and_both_run_time_options_equals_both_off` in `tests/test_bs_fast_paths.py`, and by the
+numba variants of the two release tests.
 
 - `STORE_POSITIVE_WEIGHT_ROWS_ONLY`: the weight tables of the sub-geographies keep only the rows whose balanced
   or integer weight is positive (upstream stores one row per seed household group for every zone, almost all
@@ -130,13 +133,28 @@ row to that of a run with the option off. The tests that show it: `test_example_
   per table says how many rows were kept. The seed-geography table is never filtered.
 - `FAST_PATHS`: faster implementations of the upstream result: the numba balancers look up
   `exp(log_gamma * incidence)` per distinct incidence value, the single integerizer builds its OR-Tools model by
-  setting only the non-zero coefficients, and the household expansion builds its draw lists only for the groups
-  it uses.
+  setting only the non-zero coefficients (OR-Tools only: with `USE_CVXPY: true` it does not apply, which is
+  logged once), and the household expansion builds its draw lists only for the groups it uses (the used group
+  ids are cast to the dtype of the group column first; a cast that changes an id is refused).
 
 What differs from a run with the options off: the stored weight tables (`<geography>_weights`) and the
 `trace_<geography>_weights` tables hold only the positive rows, and the `delta` of a fast balancer call may
-differ in its last bits (it only decides convergence). The `_sparse` tables, the summary tables and
-`expanded_household_ids` are equal; the example tests compare them exactly.
+differ in its last bits (it only decides convergence). `expanded_household_ids` and the `_sparse` tables are
+equal; the example tests compare them exactly. The summary tables can differ in the last bits of float sums
+(pandas' grouped sum is compensated, so dropping the zero rows can change the last bit); in the example they
+are equal.
+
+**The fast kernels and bit-for-bit equality.** The numba balancer kernels are compiled with `fastmath`. That
+the fast kernels reproduce the original ones bit for bit is therefore a property that the tests verify for an
+environment (numba and LLVM version, CPU), not one that holds by construction. Run
+`tests/test_bs_balancer_fast_path.py` in the environment and on the machine type that you use. The options are
+not tested with `multiprocess: true` for `FAST_PATHS` (the `STORE_POSITIVE_WEIGHT_ROWS_ONLY` option has a
+multiprocess example test).
+
+**Resuming a run.** A run must be resumed with the value of `STORE_POSITIVE_WEIGHT_ROWS_ONLY` it was started
+with. A weight table stored with the option on and read with it off is refused by `sub_balancing` with a
+`ValueError` that names the setting when a parent table holds fewer rows than the seed table; `summarize` does
+not check the setting and can leave NaN for a table it reads in the other mode.
 
 **Counted fallbacks of the fast balancer kernels.** A fast call falls back to the original kernel for a control
 with more than 256 distinct incidence values, for a non-finite incidence value, and when numba's SVML vector
