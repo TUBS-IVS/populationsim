@@ -431,6 +431,9 @@ def _stats(**changes):
         (STATUS_FEASIBLE, dict(converged=0), "not converged"),
         (STATUS_FEASIBLE, dict(zone_shortfall=2), "zone shortfall 2"),
         (STATUS_FEASIBLE, dict(row_shortfall=1), "row shortfall 1"),
+        (STATUS_FEASIBLE, dict(hh_unreachable=3), "3 households unreachable"),
+        (STATUS_FEASIBLE, dict(hh_outside_lp=2), "2 households placed by smart_round"),
+        (STATUS_FEASIBLE, dict(hh_excess=4), "4 households: the integer parts"),
         ("ABNORMAL", {}, "status ABNORMAL"),
     ],
 )
@@ -444,8 +447,144 @@ def test_search_call_log_lines(status, changes, reason, caplog, fork_logging):
     assert len(infos) == 1
     assert "[simul controlled] TAZ_7" in infos[0] and "method search" in infos[0]
     assert "swaps 3" in infos[0] and "sweeps 2" in infos[0]
+    expected_outside = changes.get("hh_outside_lp", 0)
+    expected_excess = changes.get("hh_excess", 0)
+    assert "hh_outside_lp %d, hh_excess %d" % (expected_outside, expected_excess) in (
+        infos[0]
+    )
     if reason is None:
         assert warnings == []
     else:
         assert len(warnings) == 1 and reason in warnings[0]
         assert "TAZ_7" in warnings[0]
+
+
+def _lp_stats(**changes):
+    stats = {
+        "x_count": 10,
+        "solver": "CBC",
+        "attempts": 1,
+        "fractional_x": 0,
+        "fractional_after_repair": 0,
+        "slack_cell": 0.0,
+        "slack_parent_sub": 0.0,
+        "slack_parent": 0.0,
+        "slack_conserve": 0.0,
+        "objective_lp": 5.0,
+        "objective_repaired": 5.0,
+        "repair_failed": False,
+        "hh_unreachable": 0,
+        "hh_outside_lp": 0,
+        "hh_excess": 0,
+    }
+    stats.update(changes)
+    return stats
+
+
+@pytest.mark.parametrize(
+    "changes, reason",
+    [
+        ({}, None),
+        (dict(hh_outside_lp=2), "2 households placed by smart_round"),
+        (dict(hh_excess=4), "4 households: the integer parts"),
+    ],
+)
+def test_lp_call_log_lines_carry_the_household_count_fields(
+    changes, reason, caplog, fork_logging
+):
+    from populationsim.integerizing import simul_integerizer
+
+    with caplog.at_level(logging.INFO, logger=simul_integerizer.logger.name):
+        simul_integerizer._log_controlled_call(
+            "TAZ_7", STATUS_OPTIMAL, _lp_stats(**changes)
+        )
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(infos) == 1
+    assert (
+        "hh_outside_lp %d, hh_excess %d"
+        % (
+            changes.get("hh_outside_lp", 0),
+            changes.get("hh_excess", 0),
+        )
+        in infos[0]
+    )
+    if reason is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1 and reason in warnings[0]
+
+
+# --- the truncating branch of the shortlist -------------------------------------
+
+
+def _large_zone_problem(seed):
+    """Four zones of 15 members each over 60 rows, every cell allowed, so that
+    every zone has far more swap candidates than a shortlist of 2."""
+    rng = np.random.RandomState(1000 + seed)
+    zones, rows, controls = 4, 60, 4
+    allowed = np.ones((zones, rows), dtype=bool)
+    targets = np.ones(rows)
+    counts = np.full(zones, rows // zones)
+    incidence = np.zeros((rows, controls))
+    incidence[:, 0] = 1.0
+    incidence[:, 1:] = rng.randint(0, 4, size=(rows, controls - 1))
+    goal = np.zeros((zones, controls))
+    goal[:, 0] = counts
+    goal[:, 1:] = rng.uniform(5.0, 30.0, size=(zones, controls - 1))
+    price = rng.choice([100.0, 300.0, 1000.0], size=controls)
+    problem = _problem(allowed, counts, targets, goal, price)
+    keys = rng.gumbel(size=(zones, rows))
+    residuals = rng.uniform(0.05, 0.95, size=(zones, rows))
+    return problem, incidence, keys, residuals
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_truncated_shortlist_keeps_margins_and_never_worsens(seed):
+    problem, incidence, keys, residuals = _large_zone_problem(seed)
+    assert problem.hh_count.min() >= 8
+    goal = problem.band_lo + problem.frac
+    price = problem.cell_penalty
+    start, _ = cs.network_start(problem, keys)
+    # a shortlist of 2 against 15 members and 45 targets per zone truncates
+    out, status, stats = _search(problem, incidence, keys, residuals, shortlist=2)
+    assert status == STATUS_FEASIBLE
+    assert stats["swaps"] > 0, "the case must exercise the search"
+    np.testing.assert_array_equal(out.sum(axis=1), problem.hh_count)
+    np.testing.assert_array_equal(out.sum(axis=0), problem.conserve_target)
+    assert set(np.unique(out)) <= {0.0, 1.0}
+    assert not (out.astype(bool) & ~problem.x_allowed).any()
+    distance_start = _objective(start, incidence, goal, price)
+    distance_final = _objective(out, incidence, goal, price)
+    assert stats["distance_start"] == pytest.approx(distance_start, abs=1e-6)
+    assert stats["distance_final"] == pytest.approx(distance_final, abs=1e-6)
+    assert distance_final <= distance_start + 1e-9
+    again, _, again_stats = _search(problem, incidence, keys, residuals, shortlist=2)
+    np.testing.assert_array_equal(out, again)
+    assert again_stats == stats
+
+
+def test_missing_min_cost_flow_module_names_the_setting(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name.startswith("ortools.graph.python"):
+            raise ImportError("No module named 'ortools.graph.python.min_cost_flow'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    with pytest.raises(ValueError) as exc:
+        cs._min_cost_flow(
+            np.array([0], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            np.array([1], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            0,
+            1,
+            1,
+        )
+    message = str(exc.value)
+    assert "INTEGERIZER_CONTROLLED_METHOD: search" in message
+    assert "ortools.graph.python.min_cost_flow" in message

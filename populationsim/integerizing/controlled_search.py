@@ -43,7 +43,10 @@ network flow with integer capacities has an integral optimum, so the start is
 0/1 without any repair. Where the margins disagree (more round-ups asked of
 the zones than the rows hold, or the reverse) the shortfalls are counted, not
 hidden: ``smart_round`` later adds the zones' missing round-ups among the rows
-the search left at 0, outside this method's choice.
+the search left at 0, outside this method's choice. With the draw on it orders
+those rows by the draw keys; with the draw off by the input residuals (largest
+first, stable order), so a missing round-up goes to a row with a residual
+while one is left (``SimulIntegerizer._integerize_controlled``).
 
 Search (:func:`solve_search`). Household ``u`` leaves sub-zone ``a`` for
 ``b`` and household ``v`` leaves ``b`` for ``a``: such a swap changes neither
@@ -108,7 +111,15 @@ def _min_cost_flow(tails, heads, capacities, costs, source, sink, supply):
     Returns ``(status_name, arc_flows)``: ``"OPTIMAL"`` and the int64 flow of
     every arc in the order given, or another status name and None.
     """
-    from ortools.graph.python import min_cost_flow
+    try:
+        from ortools.graph.python import min_cost_flow
+    except ImportError as error:
+        raise ValueError(
+            "INTEGERIZER_CONTROLLED_METHOD: search needs "
+            "ortools.graph.python.min_cost_flow, which the installed OR-Tools "
+            "does not provide (%s); install a newer OR-Tools or set "
+            "INTEGERIZER_CONTROLLED_METHOD to 'lp'" % error
+        ) from error
 
     flow = min_cost_flow.SimpleMinCostFlow()
     flow.add_arcs_with_capacity_and_unit_cost(tails, heads, capacities, costs)

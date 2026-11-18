@@ -15,8 +15,13 @@ with ``A = a @ inc``; the float cell total is ``F = w @ inc``.
 Upstream's LP asks every cell total to reach ``round(F)`` with one-sided,
 bounded slacks; where that is impossible the LP is infeasible and the
 integerizer falls back to sequential integerizing. The controlled rounding
-(``INTEGERIZER_ROUNDING: controlled``) solves a different LP that is feasible
-by construction, with this order of priorities:
+(``INTEGERIZER_ROUNDING: controlled``) decides a different problem that is
+feasible by construction, with this order of priorities. The problem is
+decided by :func:`populationsim.integerizing.controlled_search.solve_search`
+(``INTEGERIZER_CONTROLLED_METHOD: search``, the default: a network start and
+a swap search, a local optimum) or by the LP of
+:mod:`populationsim.integerizing.controlled_lp` (``lp``); the rules below are
+stated as that LP, whose relaxation the search approximates:
 
 1. hard: the number of rows rounded up in each sub-zone is the number the
    final ``smart_round`` enforces anyway, ``k[z] = clip(N[z] - sum_h a[z, h],
@@ -41,9 +46,10 @@ costs ``parent_total_factor`` times that (at most ``cap``), conservation costs
 ``conserve_penalty``. The keys are clipped to ``[-KEY_CLIP, KEY_CLIP]`` so
 that a penalty floor above that range always outranks them.
 
-This module computes the targets, bands and prices of that LP without a
-solver (:func:`build_problem`); the LP itself is built from
-:class:`ControlledProblem` and solved in ``controlled_lp``.
+This module computes the targets, bands and prices of the problem without a
+solver (:func:`build_problem`); both methods read them from
+:class:`ControlledProblem`, and the LP itself is built and solved in
+``controlled_lp``.
 
 The cell distance as a linear cost
 ----------------------------------
@@ -94,7 +100,10 @@ KEY_CLIP = 30.0
 
 @dataclass(frozen=True, eq=False)
 class ControlledProblem:
-    """Targets, bands and prices of one controlled-rounding LP.
+    """Targets, bands and prices of one controlled-rounding problem.
+
+    The problem is decided by ``controlled_search.solve_search`` (default) or
+    by the LP of ``controlled_lp``; the fields are those of the LP.
 
     Shapes: ``Z`` sub-zones, ``H`` rows, ``C`` sub controls (including the
     household total), ``P`` parent controls (may be 0). Bands and targets are
@@ -139,7 +148,7 @@ class ControlledProblem:
         the ``H`` rows of the sub-zone
     hh_outside_lp : int
         households ``smart_round`` adds among rows without a residual, outside
-        the LP's choice, ``sum (min(max(N - sum_h a, 0), H) - hh_count)``
+        the choice of the method, ``sum (min(max(N - sum_h a, 0), H) - hh_count)``
     hh_excess : int
         households the integer parts already hold beyond the integer
         controls, ``sum max(sum_h a - N, 0)``; no rounding can remove them
@@ -207,7 +216,10 @@ def build_problem(
     keys,
     penalties: PenaltySettings,
 ) -> ControlledProblem:
-    """Targets, bands and prices of the controlled-rounding LP of one parent.
+    """Targets, bands and prices of the controlled-rounding problem of one parent.
+
+    A residual of float noise (for example 4e-16) opens a cell like any other,
+    as in upstream's programme.
 
     Parameters
     ----------

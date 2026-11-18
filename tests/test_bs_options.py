@@ -298,3 +298,50 @@ def test_options_log_search_values(settings, caplog, fork_logging):
     assert "controlled_method=search" in msg
     assert "search_max_sweeps=200" in msg
     assert "search_shortlist=12" in msg
+
+
+@pytest.mark.parametrize(
+    "key,limit",
+    [
+        ("INTEGERIZER_SEARCH_MAX_SWEEPS", 1_000_000),
+        ("INTEGERIZER_SEARCH_SHORTLIST", 100_000),
+    ],
+)
+def test_search_settings_upper_bound(settings, key, limit):
+    settings[key] = limit
+    got = bs_options.search_settings()
+    assert limit in tuple(got)
+    settings[key] = limit + 1
+    with pytest.raises(ValueError, match=key) as exc:
+        bs_options.search_settings()
+    assert str(limit) in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "no_integerization, use_simul",
+    [(True, True), (True, False), (False, False)],
+)
+def test_controlled_rounding_refused_without_the_simul_integerizer(
+    settings, no_integerization, use_simul
+):
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    with pytest.raises(ValueError) as exc:
+        bs_options.check_rounding_applies(no_integerization, use_simul)
+    message = str(exc.value)
+    assert "INTEGERIZER_ROUNDING" in message
+    assert "USE_SIMUL_INTEGERIZER" in message
+    assert "NO_INTEGERIZATION_EVER" in message
+
+
+def test_controlled_rounding_accepted_with_the_simul_integerizer(settings):
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    bs_options.check_rounding_applies(False, True)
+
+
+@pytest.mark.parametrize(
+    "no_integerization, use_simul", [(True, True), (True, False), (False, False)]
+)
+def test_round_mode_is_never_refused(settings, no_integerization, use_simul):
+    bs_options.check_rounding_applies(no_integerization, use_simul)
+    settings["INTEGERIZER_ROUNDING"] = "round"
+    bs_options.check_rounding_applies(no_integerization, use_simul)

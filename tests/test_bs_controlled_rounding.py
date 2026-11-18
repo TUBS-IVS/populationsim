@@ -1605,3 +1605,42 @@ def test_controlled_with_draw_uses_the_call_generator(settings, method):
     np.testing.assert_array_equal(first.sum(axis=1), [1, 6, 5])
     outcomes = {draw(seed).tobytes() for seed in range(1, 11)}
     assert len(outcomes) > 1
+
+
+def _simul_integerizer_for(float_weights, controls, label="PUMA_2"):
+    """SimulIntegerizer for ``float_weights`` (zones x rows), only the household
+    total control; ``controls`` is the integer household control per zone."""
+    import pandas as pd
+
+    from populationsim.integerizing.simul_integerizer import SimulIntegerizer
+
+    float_weights = np.asarray(float_weights, dtype=np.float64)
+    zones, rows = float_weights.shape
+    index = pd.RangeIndex(rows, name="hh_id")
+    zone_ids = list(range(1, zones + 1))
+    incidence = pd.DataFrame({"num_hh": np.ones(rows, dtype=np.int64)}, index=index)
+    sub_weights = pd.DataFrame(float_weights.T, index=index, columns=zone_ids)
+    sub_controls = pd.DataFrame(
+        {"num_hh": np.asarray(controls, dtype=np.int64)}, index=zone_ids
+    )
+    spec = pd.DataFrame({"target": ["num_hh"], "importance": [1e9]})
+    return SimulIntegerizer(incidence, sub_weights, sub_controls, spec, "num_hh", label)
+
+
+@pytest.mark.parametrize("method", ["search", "lp"])
+def test_controlled_round_ups_outside_the_method_follow_the_residuals(settings, method):
+    """With the draw off the round-ups a zone still needs after the method go to
+    rows WITH a residual (largest first), not to rows by array position: zone 2
+    keeps its integer part on the row without residual and takes the missing
+    household from a row with residual 0.5."""
+    settings["INTEGERIZER_ROUNDING"] = "controlled"
+    settings["INTEGERIZER_CONTROLLED_METHOD"] = method
+    integerizer = _simul_integerizer_for([[0.5, 0.5, 0.0], [0.5, 0.5, 1.0]], [2, 2])
+    status = integerizer.integerize()
+    assert status in STATUS_SUCCESS
+    # (zones, rows)
+    result = integerizer.integerized_weights.to_numpy().T
+    np.testing.assert_array_equal(result.sum(axis=1), [2, 2])
+    np.testing.assert_array_equal(result[0], [1, 1, 0])
+    assert result[1, 2] == 1
+    assert result[1, :2].sum() == 1

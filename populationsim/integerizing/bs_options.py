@@ -107,8 +107,30 @@ def resolve_rounding_mode(use_cvxpy):
     return mode
 
 
+def check_rounding_applies(no_integerization_ever, use_simul_integerizer):
+    """Refuse ``INTEGERIZER_ROUNDING: controlled`` where it would be ignored.
+
+    Only the simultaneous integerizer reads the rounding mode. With
+    ``NO_INTEGERIZATION_EVER`` true or ``USE_SIMUL_INTEGERIZER`` false a run
+    rounds as upstream (or not at all), so a run that asked for the controlled
+    rounding would silently get something else. Mode ``round`` is never
+    refused.
+    """
+    if rounding_mode() != "controlled":
+        return
+    if no_integerization_ever or not use_simul_integerizer:
+        raise ValueError(
+            "INTEGERIZER_ROUNDING=controlled needs the simultaneous integerizer, "
+            "but this run does not use it (NO_INTEGERIZATION_EVER=%r, "
+            "USE_SIMUL_INTEGERIZER=%r); set NO_INTEGERIZATION_EVER to false and "
+            "USE_SIMUL_INTEGERIZER to true, or INTEGERIZER_ROUNDING to 'round'"
+            % (bool(no_integerization_ever), bool(use_simul_integerizer))
+        )
+
+
 class PenaltySettings(NamedTuple):
-    """Penalty tiers of the controlled rounding (see the fair-rounding design)."""
+    """Penalty tiers of the controlled rounding (see "Controlled rounding" in
+    the README)."""
 
     floor: float
     cap: float
@@ -223,20 +245,29 @@ class SearchSettings(NamedTuple):
     shortlist: int
 
 
-def _count(key, default):
+MAX_SEARCH_MAX_SWEEPS = 1_000_000
+MAX_SEARCH_SHORTLIST = 100_000
+
+
+def _count(key, default, upper):
     value = config.setting(key, default)
     if not _is_int(value) or value < 1:
         raise ValueError(f"{key} must be an integer >= 1, got {value!r}")
+    if value > upper:
+        raise ValueError(f"{key} must be an integer <= {upper}, got {value!r}")
     return int(value)
 
 
 def search_settings():
-    """``INTEGERIZER_SEARCH_MAX_SWEEPS`` (default 200): sweeps over all zone
-    pairs at most; ``INTEGERIZER_SEARCH_SHORTLIST`` (default 24): candidates
-    per zone priced for each zone pair. Both integers >= 1."""
+    """``INTEGERIZER_SEARCH_MAX_SWEEPS`` (default 200, at most 1,000,000):
+    sweeps over all zone pairs at most; ``INTEGERIZER_SEARCH_SHORTLIST``
+    (default 24, at most 100,000): candidates per zone priced for each zone
+    pair. Both integers >= 1."""
     return SearchSettings(
-        _count(SEARCH_MAX_SWEEPS_NAME, DEFAULT_SEARCH_MAX_SWEEPS),
-        _count(SEARCH_SHORTLIST_NAME, DEFAULT_SEARCH_SHORTLIST),
+        _count(
+            SEARCH_MAX_SWEEPS_NAME, DEFAULT_SEARCH_MAX_SWEEPS, MAX_SEARCH_MAX_SWEEPS
+        ),
+        _count(SEARCH_SHORTLIST_NAME, DEFAULT_SEARCH_SHORTLIST, MAX_SEARCH_SHORTLIST),
     )
 
 

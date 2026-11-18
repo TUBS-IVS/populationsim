@@ -289,9 +289,16 @@ class SimulIntegerizer:
         ``lp`` by the LP of
         :func:`populationsim.integerizing.controlled_lp.solve_controlled`
         (solver, retry, repair). The result is then rounded per sub-zone by
-        ``smart_round`` exactly as upstream's LP result is. A failed call
-        returns the input residuals and the failure status, so the wrapper's
-        sequential path runs as after an upstream failure.
+        ``smart_round`` as upstream's LP result is, with one difference in
+        the order of the round-ups the zone still needs after the method (zone
+        shortfall, rows outside the method): the rows are ordered by the value
+        of the method (rounded to ``draw.LP_VALUE_DECIMALS`` decimals) first
+        and by tie keys second. With the draw on the tie keys are the draw
+        keys; with the draw off they are the input residuals (largest residual
+        first, stable order), so a round-up never lands on a row without a
+        residual while a row with one is left at 0. A failed call returns the
+        input residuals and the failure status, so the wrapper's sequential
+        path runs as after an upstream failure.
 
         The household keys are those of upstream's objective: the draw keys
         (``INTEGERIZER_DRAW``) or else ``ln`` of the sub-zone residual (with
@@ -399,16 +406,21 @@ class SimulIntegerizer:
         # smart round resid_weights_out for each sub_zone, as in integerize
         integerized_weights = np.empty_like(sub_int_weights)
         sub_zone_count = len(self.sub_weights.columns)
-        if draw_keys is not None:
-            round_values = draw.rounding_values(
-                resid_weights_out, sub_resid_weights, status_text
-            )
+        # the round-ups a zone still needs after the method (zone shortfall,
+        # rows outside the method) go to the rows by the value of the method
+        # and then by the tie keys: the draw keys with the draw on, else the
+        # input residuals (largest residual first, stable order), so that no
+        # round-up lands on a row without a residual while rows with one exist
+        round_values = draw.rounding_values(
+            resid_weights_out, sub_resid_weights, status_text
+        )
         for i in range(sub_zone_count):
             if draw_keys is None:
                 integerized_weights[i] = smart_round(
                     sub_int_weights[i],
-                    resid_weights_out[i],
+                    round_values[i],
                     total_household_controls[i],
+                    tie_keys=sub_resid_weights[i],
                 )
             else:
                 integerized_weights[i] = smart_round(
@@ -440,7 +452,7 @@ def _log_controlled_call(trace_label, status_text, stats):
         "[simul controlled] %s: status %s, solver %s, attempts %d, x %d, "
         "fractional %d (%.2f%%) before and %d (%.2f%%) after the repair, "
         "slack cell %.6g, parent_sub %.6g, parent %.6g, conserve %.6g, "
-        "objective lp %.9g, repaired %.9g",
+        "objective lp %.9g, repaired %.9g, hh_outside_lp %d, hh_excess %d",
         trace_label,
         status_text,
         stats["solver"],
@@ -456,6 +468,8 @@ def _log_controlled_call(trace_label, status_text, stats):
         stats["slack_conserve"],
         stats["objective_lp"],
         stats["objective_repaired"],
+        stats["hh_outside_lp"],
+        stats["hh_excess"],
     )
     reasons = []
     if status_text not in STATUS_SUCCESS:
@@ -468,10 +482,27 @@ def _log_controlled_call(trace_label, status_text, stats):
         reasons.append(
             "%d fractional values after the repair" % stats["fractional_after_repair"]
         )
-    if stats["hh_unreachable"] > 0:
-        reasons.append("%d households unreachable" % stats["hh_unreachable"])
+    reasons.extend(_household_count_reasons(stats))
     if reasons:
         logger.warning("[simul controlled] %s: %s", trace_label, "; ".join(reasons))
+
+
+def _household_count_reasons(stats):
+    """Warning reasons of the household count rule, shared by both methods."""
+    reasons = []
+    if stats["hh_unreachable"] > 0:
+        reasons.append("%d households unreachable" % stats["hh_unreachable"])
+    if stats["hh_outside_lp"] > 0:
+        reasons.append(
+            "%d households placed by smart_round on rows without a residual "
+            "(hh_outside_lp)" % stats["hh_outside_lp"]
+        )
+    if stats["hh_excess"] > 0:
+        reasons.append(
+            "%d households: the integer parts already exceed the household "
+            "controls (hh_excess)" % stats["hh_excess"]
+        )
+    return reasons
 
 
 def _log_search_call(trace_label, status_text, stats):
@@ -482,7 +513,7 @@ def _log_search_call(trace_label, status_text, stats):
     logger.info(
         "[simul controlled] %s: method search, status %s, x %d, swaps %d, "
         "sweeps %d, converged %d, distance %.9g -> %.9g, flow %d of %d, "
-        "zone shortfall %d, row shortfall %d",
+        "zone shortfall %d, row shortfall %d, hh_outside_lp %d, hh_excess %d",
         trace_label,
         status_text,
         stats["x_count"],
@@ -495,6 +526,8 @@ def _log_search_call(trace_label, status_text, stats):
         stats["flow_wanted"],
         stats["zone_shortfall"],
         stats["row_shortfall"],
+        stats["hh_outside_lp"],
+        stats["hh_excess"],
     )
     reasons = []
     if status_text not in STATUS_SUCCESS:
@@ -513,7 +546,6 @@ def _log_search_call(trace_label, status_text, stats):
         reasons.append(
             "row shortfall %d (parent weight not placed)" % stats["row_shortfall"]
         )
-    if stats["hh_unreachable"] > 0:
-        reasons.append("%d households unreachable" % stats["hh_unreachable"])
+    reasons.extend(_household_count_reasons(stats))
     if reasons:
         logger.warning("[simul controlled] %s: %s", trace_label, "; ".join(reasons))

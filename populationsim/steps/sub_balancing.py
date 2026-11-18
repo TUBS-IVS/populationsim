@@ -7,6 +7,7 @@ import logging
 import pandas as pd
 
 from populationsim.balancing import do_simul_balancing
+from populationsim.integerizing import bs_options
 from populationsim.integerizing import (
     do_no_integerizing,
     do_simul_integerizing,
@@ -139,6 +140,11 @@ def balance_and_integerize(
 
     trace_label = "%s_%s" % (parent_geography, parent_id)
 
+    # fork: the controlled rounding is only read by the simultaneous integerizer
+    bs_options.check_rounding_applies(
+        config.setting("NO_INTEGERIZATION_EVER", False),
+        config.setting("USE_SIMUL_INTEGERIZER", True),
+    )
     if config.setting("NO_INTEGERIZATION_EVER", False):
         integerizer = do_no_integerizing
         int_method = "no_integerizing"

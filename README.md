@@ -34,11 +34,13 @@ infeasible and the integerizer falls back to sequential integerizing.
 
 1. every sub-zone gets the household count that the final `smart_round` enforces in both modes: its integer
    parts plus `clip(household control - integer parts, 0, rows of the parent)`;
-2. every household row of the parent is placed exactly as often as its parent weight says (the weight summed
-   over the sub-zones is kept);
+2. as far as rule 1 allows, every household row of the parent is placed exactly as often as its parent weight
+   says (the weight summed over the sub-zones is kept);
 3. among such tables, the importance-weighted distance of the integer cell totals to the float cell totals is
-   as small as possible (the control's importance, clipped to the penalty floor and cap, is the weight);
-4. the household keys (the draw keys, or `ln` of the residual) only break the remaining ties.
+   lowered (the control's importance, clipped to the penalty floor and cap, is the weight): `lp` minimises
+   its relaxation, `search` ends in a local optimum that depends on its start table;
+4. the household keys (the draw keys, or `ln` of the residual) decide the start table of `search` and break
+   the ties in `lp`.
 
 Rule 1 wins where rules 1 and 2 cannot both hold (the household controls of the sub-zones do not add up to the
 parent's households, or a control asks for more than the rows with a residual can supply). What the rows cannot
@@ -56,10 +58,10 @@ place is counted in the path record (`row_shortfall`, `zone_shortfall`, `hh_unre
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `INTEGERIZER_ROUNDING` | `round` | `round` (upstream) or `controlled`; `controlled` needs the OR-Tools integerizer (`USE_CVXPY: false`) |
+| `INTEGERIZER_ROUNDING` | `round` | `round` (upstream) or `controlled`; `controlled` needs the OR-Tools integerizer (`USE_CVXPY: false`) and the simultaneous integerizer (`USE_SIMUL_INTEGERIZER: true`, `NO_INTEGERIZATION_EVER: false`); a run that cannot use it is refused instead of rounding as upstream |
 | `INTEGERIZER_CONTROLLED_METHOD` | `search` | `search` or `lp` |
-| `INTEGERIZER_SEARCH_MAX_SWEEPS` | `200` | `search`: sweeps over all zone pairs at most (integer >= 1) |
-| `INTEGERIZER_SEARCH_SHORTLIST` | `24` | `search`: swap candidates priced per zone and zone pair (integer >= 1) |
+| `INTEGERIZER_SEARCH_MAX_SWEEPS` | `200` | `search`: sweeps over all zone pairs at most (integer, 1 to 1,000,000) |
+| `INTEGERIZER_SEARCH_SHORTLIST` | `24` | `search`: swap candidates priced per zone and zone pair (integer, 1 to 100,000) |
 | `INTEGERIZER_PENALTY_FLOOR` | `100.0` | lowest price of one unit of cell distance (> 0) |
 | `INTEGERIZER_PENALTY_CAP` | `100000.0` | highest price (>= floor) |
 | `INTEGERIZER_PARENT_TOTAL_FACTOR` | `10.0` | `lp` only: price of a parent total relative to a cell (>= 1) |
@@ -75,9 +77,15 @@ place is counted in the path record (`row_shortfall`, `zone_shortfall`, `hh_unre
   `converged` in the path record tells whether the search stopped by itself (1) or by the sweep limit (0).
 - The household total of a run can differ from a `round` run of the same inputs. On the simultaneous path both
   modes give a sub-zone the count of rule 1; where upstream's programme is infeasible, `round` takes the
-  sequential path, which only sees the rows with a weight in that zone. In `examples/example_test` two
-  sub-zones whose household control the balanced weights cannot reach therefore get 15 households instead of
-  14 (`test_controlled_zone_household_counts_follow_smart_round` in `tests/test_bs_release_equivalence.py`).
+  sequential path, which only sees the rows with a weight in that zone. In `examples/example_test` some
+  sub-zones have a household control that the balanced weights cannot reach, so the household total of a
+  `controlled` run differs from that of a `round` run;
+  `test_controlled_zone_household_counts_follow_smart_round` in `tests/test_bs_release_equivalence.py` asserts
+  the household count rule for every sub-zone of that example (it does not assert the totals of a `round` run).
+- The result is deterministic for a given seed and OR-Tools version: ties between equal keys are resolved inside
+  the min-cost-flow solver. The `lp` method has a time limit per attempt, so its status can depend on the
+  machine load (counted in the record). A residual of float noise (for example 4e-16) opens a cell like any
+  other, as in upstream's programme.
 - Conserving every row's parent weight needs integer parent weights, i.e.
   `SUB_BALANCE_WITH_FLOAT_SEED_WEIGHTS: false`. With float seed weights the integer parent totals can differ
   from the float ones.
