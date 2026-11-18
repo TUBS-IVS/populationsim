@@ -691,3 +691,147 @@ def test_example_run_unchanged_with_fast_paths(tmp_path, precision):
     assert "single balancer: kernel np_balancer_numba_fast" in on_log
     assert "simul balancer: kernel np_simul_balancer_numba_fast" in on_log
     assert "np_balancer_numba_fast" not in log_text("off")
+
+
+# ---------------------------------------------------------------------------
+# Rate summary at exit, delta guard on a real threshold, value cap check (#656)
+# ---------------------------------------------------------------------------
+
+
+def _rate_records(caplog):
+    return [r for r in caplog.records if "balancer fast path:" in r.getMessage()]
+
+
+def test_rate_line_is_a_warning_with_the_exact_numbers_after_a_fallback(
+    caplog, fork_logging
+):
+    np_balancer_numba_fast(*_copy_args(_single_problem(1, 50)))
+    np_balancer_numba_fast(*_copy_args(_problem_with_distinct_values(257)))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=balancers_numba.__name__):
+        balancers_numba.log_fast_path_rate()
+    records = _rate_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].getMessage() == (
+        "balancer fast path: fast 1 of 2 calls (50.0 %), fallback value cap 1, "
+        "fallback SVML 0, fallback non-finite 0, re-run after the delta guard 0"
+    )
+
+
+def test_rate_line_is_info_when_every_call_was_fast(caplog, fork_logging):
+    np_balancer_numba_fast(*_copy_args(_single_problem(1, 50)))
+    np_simul_balancer_numba_fast(*_copy_args(_simul_problem(1, 50)))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=balancers_numba.__name__):
+        balancers_numba.log_fast_path_rate()
+    records = _rate_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert "fast 2 of 2 calls (100.0 %)" in records[0].getMessage()
+
+
+def test_rate_line_counts_a_delta_guard_rerun_as_a_warning(
+    monkeypatch, caplog, fork_logging
+):
+    monkeypatch.setattr(balancers_numba, "FAST_PATH_DELTA_BAND", 1e300)
+    np_balancer_numba_fast(*_copy_args(_single_problem(2, 300)))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=balancers_numba.__name__):
+        balancers_numba.log_fast_path_rate()
+    (record,) = _rate_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert "fast 0 of 1 calls (0.0 %)" in record.getMessage()
+    assert "re-run after the delta guard 1" in record.getMessage()
+
+
+def test_rate_line_goes_to_a_given_logger(caplog, fork_logging):
+    np_balancer_numba_fast(*_copy_args(_single_problem(1, 50)))
+    caplog.clear()
+    other = logging.getLogger("populationsim.test_rate_target")
+    with caplog.at_level(logging.INFO, logger=other.name):
+        balancers_numba.log_fast_path_rate(other)
+    (record,) = _rate_records(caplog)
+    assert record.name == other.name
+
+
+def test_rate_summary_is_registered_with_atexit_once(monkeypatch):
+    registered = []
+    monkeypatch.setattr(
+        balancers_numba.atexit, "register", lambda *a, **k: registered.append(a)
+    )
+    monkeypatch.setitem(balancers_numba._FAST_PATH_STATE, "atexit_registered", False)
+    for _ in range(3):
+        np_balancer_numba_fast(*_copy_args(_single_problem(1, 50)))
+        np_simul_balancer_numba_fast(*_copy_args(_simul_problem(1, 50)))
+    assert registered == [(balancers_numba.log_fast_path_rate,)]
+
+
+def _original_deltas(args, last):
+    """delta of iterations 1..last of the original kernel, via max_iterations=k."""
+    deltas = []
+    for k in range(1, last + 1):
+        run_args = list(_copy_args(args))
+        run_args[-1] = k
+        status = np_balancer_numba(*run_args)[2]
+        assert not status[0], "problem converged inside the probed iterations"
+        deltas.append(float(status[2]))
+    return deltas
+
+
+def test_delta_guard_fires_on_one_real_near_threshold_iteration(monkeypatch):
+    """The guard fires when exactly one iteration's delta is inside the band."""
+    args = list(_single_problem(2, 700))
+    total_iterations = 12
+    args[-1] = total_iterations
+    deltas = _original_deltas(args, total_iterations)
+    band = balancers_numba.FAST_PATH_DELTA_BAND
+    assert band == 1.0e-6  # the shipped relative width
+    chosen = 5
+    # a centre 5e-7 (relative) above the chosen delta: inside the band for it
+    center = deltas[chosen] * (1.0 + 0.5 * band)
+    inside = [i for i, d in enumerate(deltas) if abs(d - center) <= band * center]
+    assert inside == [chosen], "the probe problem must have one delta in the band"
+    monkeypatch.setattr(balancers_numba, "FAST_PATH_BAND_CENTER_1", center)
+    monkeypatch.setattr(balancers_numba, "FAST_PATH_BAND_CENTER_2", 1e300)
+    orig = np_balancer_numba(*_copy_args(args))
+    fast = np_balancer_numba_fast(*_copy_args(args))
+    assert fast_path_counts()["single"]["rerun_delta_band"] == 1
+    assert fast_path_counts()["single"]["fast"] == 0
+    # the original's result, bit for bit including delta
+    assert _bytes_equal(orig[0], fast[0])
+    assert _bytes_equal(orig[1], fast[1])
+    assert _status_key(orig[2]) == _status_key(fast[2])
+
+
+def test_lookup_delta_agrees_with_the_original_far_inside_the_band():
+    """Relative delta difference below 1e-9 on 50+ seeded problems (band 1e-6)."""
+    worst = 0.0
+    compared = 0
+    for seed in range(60):
+        args = _single_problem(seed)
+        orig = np_balancer_numba(*_copy_args(args))
+        values, n_values, codes, status = balancers_numba._encode_incidence(
+            args[3], 256
+        )
+        if status != 0:
+            continue
+        # a zero band never flags, so the lookup kernel runs to its own end
+        fast = balancers_numba._np_balancer_lookup(
+            *_copy_args(args), values, n_values, codes, 0.0
+        )
+        d_orig = float(orig[2][2])
+        d_fast = float(fast[2][2])
+        if d_orig > 0.0:
+            worst = max(worst, abs(d_fast - d_orig) / d_orig)
+        compared += 1
+    assert compared >= 50
+    assert worst < 1e-9
+
+
+def test_value_cap_above_the_code_dtype_raises_value_error(monkeypatch):
+    monkeypatch.setattr(balancers_numba, "FAST_PATH_MAX_VALUES", 257)
+    with pytest.raises(ValueError, match="FAST_PATH_MAX_VALUES"):
+        np_balancer_numba_fast(*_copy_args(_single_problem(1, 50)))
+    with pytest.raises(ValueError, match="FAST_PATH_MAX_VALUES"):
+        np_simul_balancer_numba_fast(*_copy_args(_simul_problem(1, 50)))

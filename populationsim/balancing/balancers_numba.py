@@ -1,3 +1,4 @@
+import atexit
 import logging
 import numpy as np
 from numba import njit
@@ -279,11 +280,18 @@ def np_simul_balancer_numba(
 _LOGGED_KERNEL_CHOICES = set()
 
 # Most distinct incidence values of one control the lookup table takes; the
-# codes are uint8, so this cannot exceed 256.
+# codes are uint8, so this cannot exceed _CODE_DTYPE_CAPACITY (checked at every
+# fast call, not by an assert that python -O would strip).
 FAST_PATH_MAX_VALUES = 256
+_CODE_DTYPE_CAPACITY = np.iinfo(np.uint8).max + 1
 # Relative band around MAX_DELTA32 and ALT_MAX_DELTA in which the result of a
 # fast kernel is discarded (read at call time, so a test can widen it).
 FAST_PATH_DELTA_BAND = 1.0e-6
+# The two delta values the band is centred on (read at call time and handed to
+# the kernel, because numba freezes module constants when it compiles; the
+# convergence tests inside the kernels keep using MAX_DELTA32 and ALT_MAX_DELTA).
+FAST_PATH_BAND_CENTER_1 = MAX_DELTA32
+FAST_PATH_BAND_CENTER_2 = ALT_MAX_DELTA
 # Fallback warnings logged in full; after that one summary every
 # _FAST_PATH_WARNING_EVERY events.
 _FAST_PATH_WARNING_LIMIT = 5
@@ -299,7 +307,11 @@ _FAST_PATH_OUTCOMES = (
 _FAST_PATH_COUNTS = {
     kind: dict.fromkeys(_FAST_PATH_OUTCOMES, 0) for kind in ("single", "simul")
 }
-_FAST_PATH_STATE = {"fallback_events": 0, "first_call_logged": set()}
+_FAST_PATH_STATE = {
+    "fallback_events": 0,
+    "first_call_logged": set(),
+    "atexit_registered": False,
+}
 
 _ENCODE_OK = 0
 _ENCODE_VALUE_CAP = 1
@@ -325,6 +337,50 @@ def reset_fast_path_counts():
             counts[outcome] = 0
     _FAST_PATH_STATE["fallback_events"] = 0
     _FAST_PATH_STATE["first_call_logged"] = set()
+
+
+def log_fast_path_rate(logger=None):
+    """Log ONE summary line of the fast-path outcomes of this process.
+
+    INFO when every call took the fast kernel, WARNING when any call fell back
+    to the original kernel or was re-run after the delta guard. Registered with
+    ``atexit`` on the first fast call, so every run ends with this line.
+    """
+    logger = logger or globals()["logger"]
+    totals = dict.fromkeys(_FAST_PATH_OUTCOMES, 0)
+    for counts in _FAST_PATH_COUNTS.values():
+        for outcome, n in counts.items():
+            totals[outcome] += n
+    calls = sum(totals.values())
+    percent = 100.0 * totals["fast"] / calls if calls else 0.0
+    level = logging.INFO if calls == totals["fast"] else logging.WARNING
+    logger.log(
+        level,
+        "balancer fast path: fast %d of %d calls (%.1f %%), fallback value cap %d, "
+        "fallback SVML %d, fallback non-finite %d, re-run after the delta guard %d",
+        totals["fast"],
+        calls,
+        percent,
+        totals["fallback_value_cap"],
+        totals["fallback_svml"],
+        totals["fallback_nonfinite"],
+        totals["rerun_delta_band"],
+    )
+
+
+def _register_exit_summary():
+    if _FAST_PATH_STATE["atexit_registered"]:
+        return
+    _FAST_PATH_STATE["atexit_registered"] = True
+    atexit.register(log_fast_path_rate)
+
+
+def _check_value_cap():
+    if not 1 <= FAST_PATH_MAX_VALUES <= _CODE_DTYPE_CAPACITY:
+        raise ValueError(
+            "FAST_PATH_MAX_VALUES=%d does not fit the uint8 incidence codes "
+            "(allowed: 1 to %d)" % (FAST_PATH_MAX_VALUES, _CODE_DTYPE_CAPACITY)
+        )
 
 
 def log_kernel_choice_once(use_numba):
@@ -469,10 +525,10 @@ def _encode_incidence(incidence, max_values):
 
 def _encoded_or_fallback(kind, incidence):
     """The encoded incidence, or None after counting the fallback reason."""
+    _check_value_cap()
     if _svml_active():
         _record(kind, "fallback_svml")
         return None
-    assert FAST_PATH_MAX_VALUES <= 256, "codes are uint8"
     values, n_values, codes, status = _encode_incidence(incidence, FAST_PATH_MAX_VALUES)
     if status == _ENCODE_VALUE_CAP:
         _record(kind, "fallback_value_cap")
@@ -502,6 +558,7 @@ def np_balancer_numba_fast(
     may differ in its last bits). Falls back to, or re-runs, the original
     kernel as described above; every such call is counted and logged.
     """
+    _register_exit_summary()
     _log_first_call("single", "np_balancer_numba_fast")
     original_args = (
         sample_count,
@@ -521,7 +578,13 @@ def np_balancer_numba_fast(
     values, n_values, codes = encoded
     # The kernel copies weights_initial and mutates none of its inputs.
     weights, relaxation_factors, status, near_threshold = _np_balancer_lookup(
-        *original_args, values, n_values, codes, float(FAST_PATH_DELTA_BAND)
+        *original_args,
+        values,
+        n_values,
+        codes,
+        float(FAST_PATH_DELTA_BAND),
+        float(FAST_PATH_BAND_CENTER_1),
+        float(FAST_PATH_BAND_CENTER_2),
     )
     if near_threshold:
         _record("single", "rerun_delta_band")
@@ -553,6 +616,7 @@ def np_simul_balancer_numba_fast(
     re-run of the original kernel starts from the untouched inputs; the
     accepted result is copied back into the caller's arrays.
     """
+    _register_exit_summary()
     _log_first_call("simul", "np_simul_balancer_numba_fast")
 
     def original():
@@ -598,6 +662,8 @@ def np_simul_balancer_numba_fast(
         n_values,
         codes,
         float(FAST_PATH_DELTA_BAND),
+        float(FAST_PATH_BAND_CENTER_1),
+        float(FAST_PATH_BAND_CENTER_2),
     )
     if near_threshold:
         _record("simul", "rerun_delta_band")
@@ -624,6 +690,8 @@ def _np_balancer_lookup(
     n_values,
     codes,
     delta_band,
+    band_center_1=MAX_DELTA32,
+    band_center_2=ALT_MAX_DELTA,
 ):
     """Copy of ``np_balancer_numba`` with a per-control lookup table.
 
@@ -717,8 +785,8 @@ def _np_balancer_lookup(
                 max_gamma_dif = g_dif
 
         if (
-            abs(delta - MAX_DELTA32) <= delta_band * MAX_DELTA32
-            or abs(delta - ALT_MAX_DELTA) <= delta_band * ALT_MAX_DELTA
+            abs(delta - band_center_1) <= delta_band * band_center_1
+            or abs(delta - band_center_2) <= delta_band * band_center_2
         ):
             return (
                 weights_final,
@@ -765,6 +833,8 @@ def _np_simul_balancer_lookup(
     n_values,
     codes,
     delta_band,
+    band_center_1=MAX_DELTA32,
+    band_center_2=ALT_MAX_DELTA,
 ):
     """Copy of ``np_simul_balancer_numba`` with a per-control lookup table.
 
@@ -858,8 +928,8 @@ def _np_simul_balancer_lookup(
         delta = np.abs(sub_weights - weights_previous).sum() / float(sample_count)
 
         if (
-            abs(delta - MAX_DELTA32) <= delta_band * MAX_DELTA32
-            or abs(delta - ALT_MAX_DELTA) <= delta_band * ALT_MAX_DELTA
+            abs(delta - band_center_1) <= delta_band * band_center_1
+            or abs(delta - band_center_2) <= delta_band * band_center_2
         ):
             return (
                 sub_weights,
