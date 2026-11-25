@@ -2,7 +2,7 @@
 
 Base: upstream tag `v0.10.0`. Every new setting defaults to upstream behaviour.
 
-## 0.10.0+bs.3 (unreleased)
+## 0.10.0+bs.3
 
 - `FAST_PATHS`: the household expansion (`expand_households`, `GROUP_BY_INCIDENCE_SIGNATURE`) now takes all draws in one batch (`draw_household_ids`) from the same random numbers in the same order as upstream's per-row `choice`, so the table and the generator state are unchanged; two failure paths differ: invalid weights (not finite, negative, sum 0) give a `ValueError` naming the group (upstream fails inside `RandomState.choice`), and with float32 weights on a large group upstream raises "probabilities do not sum to 1" while the fast draw returns a population (on and off differ there); it replaces the lists-for-used-groups build of `0.10.0+bs.2`, which is removed.
 - `FAST_PATHS`: the simultaneous integerizer's result frame (`reshape_result`) is built in one pass over whole arrays instead of one `DataFrame` per sub-zone (`_reshape_result_fast`); frame, index, dtypes, positive-row tally and `ValueError`s are those of the upstream loop, which stays as the off path.
