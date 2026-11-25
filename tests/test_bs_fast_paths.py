@@ -858,7 +858,7 @@ def _assert_reshape_equal(settings, float_weights, integerized, zones, positive)
 
 
 @pytest.mark.parametrize("positive", [False, True])
-@pytest.mark.parametrize("zone_type", [int, np.int64, np.int32])
+@pytest.mark.parametrize("zone_type", [int, np.int64, np.int32, float, str])
 @pytest.mark.parametrize("zone_count", [1, 7])
 @pytest.mark.parametrize("integer_dtype", [np.int64, np.float64])
 def test_reshape_result_fast_equals_upstream(
@@ -975,6 +975,81 @@ def test_reshape_result_fast_counts_the_zones_before_an_offender_like_upstream(
     upstream = _tally_after_error(settings, False, float_weights, integerized, zones)
     fast = _tally_after_error(settings, True, float_weights, integerized, zones)
     assert len(upstream) == bad_zone
+    assert fast == upstream
+
+
+def _tally_of_failing_call(settings, fast, float_weights, integerized, zones, positive):
+    from populationsim.core import positive_weight_rows as pwr
+    from populationsim.integerizing import wrappers as iw
+
+    pwr._TALLY.clear()
+    settings.clear()
+    settings.update({SETTING: False, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+    try:
+        with pytest.raises(Exception) as error:
+            if fast:
+                iw._reshape_result_fast(
+                    float_weights, integerized, "TAZ", zones, positive
+                )
+            else:
+                iw.reshape_result(float_weights, integerized, "TAZ", zones)
+        return type(error.value), str(error.value), dict(pwr._TALLY)
+    finally:
+        pwr._TALLY.clear()
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("bad_zone", [0, 2, 3])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_reshape_result_fast_integer_cast_error_and_tally_are_upstreams(
+    settings, positive, bad_zone, bad
+):
+    """A float integerized_weights table with a value astype(int) refuses: upstream
+    casts zone by zone, so the zones before it are tallied and its error is raised."""
+    float_weights, integerized, names = _reshape_inputs(
+        4, seed=2, integer_dtype=np.float64
+    )
+    integerized.iloc[5, bad_zone] = bad
+    zones = _zones(names, int)
+    upstream = _tally_of_failing_call(
+        settings, False, float_weights, integerized, zones, positive
+    )
+    fast = _tally_of_failing_call(
+        settings, True, float_weights, integerized, zones, positive
+    )
+    assert fast == upstream
+    assert "non-finite" in upstream[1]
+    assert len(upstream[2]) == (bad_zone if positive else 0)
+
+
+def test_reshape_result_fast_invalid_weight_before_a_cast_error_wins_like_upstream(
+    settings,
+):
+    float_weights, integerized, names = _reshape_inputs(
+        4, seed=2, integer_dtype=np.float64
+    )
+    float_weights.iloc[3, 1] = -1.0  # zone 1: negative balanced weight
+    integerized.iloc[5, 2] = np.nan  # zone 2: not castable
+    zones = _zones(names, int)
+    upstream = _tally_of_failing_call(
+        settings, False, float_weights, integerized, zones, True
+    )
+    fast = _tally_of_failing_call(
+        settings, True, float_weights, integerized, zones, True
+    )
+    assert "negative" in upstream[1] and len(upstream[2]) == 1
+    assert fast == upstream
+    # and the other way round: the cast error of zone 1 comes before zone 2's NaN
+    float_weights.iloc[3, 1] = 0.0
+    float_weights.iloc[3, 2] = np.nan
+    integerized.iloc[5, 1] = np.nan
+    upstream = _tally_of_failing_call(
+        settings, False, float_weights, integerized, zones, True
+    )
+    fast = _tally_of_failing_call(
+        settings, True, float_weights, integerized, zones, True
+    )
+    assert "non-finite" in upstream[1] and len(upstream[2]) == 1
     assert fast == upstream
 
 

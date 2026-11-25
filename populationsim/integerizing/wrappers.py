@@ -119,6 +119,43 @@ def try_simul_integerizing(
     return status, integerized_weights_df
 
 
+def _raise_like_upstream_cast_error(
+    integerized_weights, zone_ids, zone_names, balanced, positive_only
+):
+    """Leave the tally and raise the error the upstream loop does, zone by zone.
+
+    Upstream casts ``integerized_weights`` to int one zone at a time and filters
+    each zone's frame right after building it. So with a column that cannot be
+    cast (a NaN), the zones before the first such zone are already filtered and
+    tallied (and an invalid weight among them raises first), and the cast error of
+    the first such zone is what is raised. The fast path casts all zones at once;
+    when that fails, this finds the first failing zone, does what upstream did for
+    the zones before it and raises the cast error of that zone itself. Returns
+    without raising only if no single zone fails by itself.
+    """
+    failing = None
+    for position, zone_name in enumerate(zone_names):
+        try:
+            integerized_weights[zone_name].astype(int)
+        except Exception:
+            failing = position
+            break
+    if failing is None:
+        return
+    if positive_only and failing > 0:
+        positive_weight_rows.positive_row_mask(
+            zone_ids[:failing],
+            {
+                "balanced_weight": balanced[:failing],
+                "integer_weight": integerized_weights[zone_names[:failing]]
+                .astype(int)
+                .to_numpy()
+                .T,
+            },
+        )
+    integerized_weights[zone_names[failing]].astype(int)
+
+
 def _reshape_result_fast(
     float_weights, integerized_weights, sub_geography, sub_control_zones, positive_only
 ):
@@ -147,7 +184,15 @@ def _reshape_result_fast(
 
     # one row per zone, one column per household: C order is zone-major
     balanced = float_weights[zone_names].to_numpy().T
-    integer = integerized_weights[zone_names].astype(int).to_numpy().T
+    try:
+        integer = integerized_weights[zone_names].astype(int).to_numpy().T
+    except Exception:
+        # raises the failing zone's own cast error (after upstream's tally) ...
+        _raise_like_upstream_cast_error(
+            integerized_weights, zone_ids, zone_names, balanced, positive_only
+        )
+        # ... or, if no single zone fails by itself, this is the original error
+        raise
 
     if positive_only:
         keep = positive_weight_rows.positive_row_mask(
