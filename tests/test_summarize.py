@@ -140,6 +140,39 @@ def test_float_weights_with_unsorted_controls_keep_int_ids(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "weight_col, weight_dtype",
+    [("integer_weight", np.int32), ("balanced_weight", np.float64)],
+)
+def test_uncast_weight_table_dtypes(monkeypatch, weight_col, weight_dtype):
+    """The weight table is passed as is: int32 ids and int32 integer weights (the
+    Windows default integer), float64 balanced weights."""
+    controls = _controls([20, 10, 30], [5, 6, 7])
+    monkeypatch.setattr(step, "get_control_table", lambda g: controls)
+    crosswalk = pd.DataFrame({"zone": controls.index.to_numpy()})
+    incidence = pd.DataFrame(
+        {"count": 1}, index=pd.Index([1, 2, 3], name="hh_id", dtype=np.int32)
+    )
+    results_df = pd.DataFrame(
+        {
+            "zone": np.array([10, 20, 10], dtype=np.int32),
+            "hh_id": np.array([1, 2, 3], dtype=np.int32),
+            weight_col: np.array([2, 4, 1], dtype=weight_dtype),
+        }
+    )
+    out = step.summarize_geography(
+        "zone", weight_col, "hh_id", crosswalk, results_df, incidence
+    )
+
+    assert out["id"].tolist() == [20, 10, 30]
+    assert out["count_result"].tolist() == [4, 3, 0]
+    np.testing.assert_array_equal(
+        out["count_diff"].to_numpy(),
+        out["count_result"].to_numpy() - out["count_control"].to_numpy(),
+    )
+    assert out["count_diff"].tolist() == [-1, -3, -7]
+
+
+@pytest.mark.parametrize(
     "weight_col, result_dtype",
     [("integer_weight", np.int64), ("balanced_weight", np.float64)],
 )

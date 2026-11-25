@@ -21,8 +21,7 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
     weights of a run use only a small share of the groups. This draws all rows
     at once and works only on the groups that occur, with whole-array numpy
     operations on one stable sort of ``household_groups`` (no pandas object per
-    group, which made the first version several times slower than upstream's
-    list build).
+    group).
 
     Why the draw equals upstream's. ``RandomState.choice(a, p=p)`` with no size
     takes one ``random_sample()`` uniform, builds ``cdf = p.cumsum()``,
@@ -57,7 +56,8 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
     nothing.
 
     Differences in failure. Upstream fails inside ``choice`` on probabilities
-    that are negative or do not sum to 1, and not at all on NaN; a group whose
+    that are negative, contain NaN (``ValueError: probabilities contain NaN``,
+    NumPy 1.26.4) or do not sum to 1; a group whose
     weights are not finite, are negative or sum to 0 raises a ``ValueError`` that
     names the group here, and a group id without households raises a
     ``ValueError`` where upstream raises a ``KeyError`` or ``IndexError``. Every

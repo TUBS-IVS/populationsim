@@ -132,7 +132,7 @@ numba variants of the two release tests.
   or integer weight is positive (upstream stores one row per seed household group for every zone, almost all
   with weight 0); the next geography rebuilds the full parent weight vector. A line `[positive weight rows]`
   per table says how many rows were kept. The seed-geography table is never filtered.
-- `FAST_PATHS`: faster implementations of the upstream result: the numba balancers look up
+- `FAST_PATHS`: implementations aimed at run time, with the result of the upstream path: the numba balancers look up
   `exp(log_gamma * incidence)` per distinct incidence value, the single integerizer builds its OR-Tools model by
   setting only the non-zero coefficients (OR-Tools only: with `USE_CVXPY: true` it does not apply, which is
   logged once), and the household expansion takes all draws of the step in one batch, from the same random numbers in the
