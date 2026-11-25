@@ -10,13 +10,15 @@ results to the control order by zone id.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from populationsim.steps import summarize as step
 from tests.settings_isolation import patch_settings
-from tests.test_bs_positive_weight_rows import _run_summarize, _summarize_problem
+from tests.summary_helpers import run_summarize, summarize_problem
 
 
 def _controls(ids, counts):
@@ -25,18 +27,32 @@ def _controls(ids, counts):
     )
 
 
-def _summarize(monkeypatch, controls, results):
+def _summarize(monkeypatch, controls, results, weight_col="integer_weight"):
     """``summarize_geography`` of geography ``zone`` with one control ``count``;
-    every household has incidence 1, so a zone's result is its weight sum."""
+    every household has incidence 1, so a zone's result is its weight sum.
+    ``results`` are ``[zone, hh_id, weight]`` rows."""
     monkeypatch.setattr(step, "get_control_table", lambda g: controls)
     crosswalk = pd.DataFrame({"zone": controls.index.to_numpy()})
     incidence = pd.DataFrame(
         {"count": 1}, index=pd.Index([1, 2, 3, 4], name="hh_id", dtype=np.int64)
     )
-    results_df = pd.DataFrame(results, columns=["zone", "hh_id", "integer_weight"])
+    results_df = pd.DataFrame(results, columns=["zone", "hh_id", weight_col])
+    results_df = results_df.astype({"zone": np.int64, "hh_id": np.int64})
+    if weight_col == "integer_weight":
+        results_df[weight_col] = results_df[weight_col].astype(np.int64)
+    else:
+        results_df[weight_col] = results_df[weight_col].astype(np.float64)
     return step.summarize_geography(
-        "zone", "integer_weight", "hh_id", crosswalk, results_df, incidence
+        "zone", weight_col, "hh_id", crosswalk, results_df, incidence
     )
+
+
+def _summary_log(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.name == step.logger.name and r.getMessage().startswith("[summarize]")
+    ]
 
 
 def test_diff_aligned_by_zone_id_when_control_order_differs(monkeypatch):
@@ -77,6 +93,74 @@ def test_zone_without_rows_gets_zero_result(monkeypatch):
     assert out["count_result"].dtype == np.int64
 
 
+def test_missing_zone_is_logged_as_a_warning_with_its_rate(
+    monkeypatch, caplog, fork_logging
+):
+    controls = _controls([10, 20, 30], [5, 6, 7])
+    with caplog.at_level(logging.INFO, logger=step.logger.name):
+        _summarize(monkeypatch, controls, [[10, 1, 2], [30, 2, 4]])
+    (record,) = _summary_log(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "[summarize] zone: zones in the weight table 2/3 (66.7 %), "
+        "missing 1 (33.3 %) filled with result 0"
+    )
+
+
+def test_no_missing_zone_is_logged_as_info(monkeypatch, caplog, fork_logging):
+    controls = _controls([20, 10], [5, 6])
+    with caplog.at_level(logging.INFO, logger=step.logger.name):
+        _summarize(monkeypatch, controls, [[10, 1, 2], [20, 2, 4]])
+    (record,) = _summary_log(caplog)
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == (
+        "[summarize] zone: zones in the weight table 2/2 (100.0 %), "
+        "missing 0 (0.0 %) filled with result 0"
+    )
+
+
+def test_float_weights_with_unsorted_controls_keep_int_ids(monkeypatch):
+    """The float-weight path (``balanced_weight``, as with
+    ``NO_INTEGERIZATION_EVER: true``): the groupby index is float, the ids and
+    labels follow the int control index."""
+    controls = _controls([20, 10, 30], [5, 6, 7])
+    results = [[10, 1, 2.5], [20, 2, 4.25], [30, 3, 1.0]]
+    out = _summarize(monkeypatch, controls, results, weight_col="balanced_weight")
+
+    assert out.index.tolist() == ["zone_20", "zone_10", "zone_30"]
+    assert out["id"].tolist() == [20, 10, 30]
+    assert out["id"].dtype == np.int64
+    assert out["count_result"].dtype == np.float64
+    assert out["count_result"].tolist() == [4.25, 2.5, 1.0]
+    np.testing.assert_array_equal(
+        out["count_diff"].to_numpy(),
+        out["count_result"].to_numpy() - out["count_control"].to_numpy(),
+    )
+    assert out["count_diff"].tolist() == [-0.75, -3.5, -6.0]
+
+
+@pytest.mark.parametrize(
+    "weight_col, result_dtype",
+    [("integer_weight", np.int64), ("balanced_weight", np.float64)],
+)
+def test_all_empty_geography_keeps_the_result_dtype(
+    monkeypatch, weight_col, result_dtype
+):
+    """No weight rows in any zone: every zone gets result 0 in the dtype the
+    non-empty path gives (no extra zero row, int ids)."""
+    controls = _controls([20, 10], [5, 6])
+    empty = np.zeros((0, 3))
+    out = _summarize(monkeypatch, controls, empty, weight_col=weight_col)
+    nonempty = _summarize(monkeypatch, controls, [[10, 1, 2]], weight_col=weight_col)
+
+    assert out.index.tolist() == ["zone_20", "zone_10"]
+    assert out["id"].tolist() == [20, 10]
+    assert out["count_result"].tolist() == [0, 0]
+    assert out["count_diff"].tolist() == [-5, -6]
+    assert out["count_result"].dtype == result_dtype
+    pd.testing.assert_series_equal(out.dtypes, nonempty.dtypes)
+
+
 @pytest.mark.parametrize("taz_order", [[1, 2, 3], [3, 1, 2]])
 def test_positive_rows_layout_gives_same_diff(monkeypatch, taz_order):
     """Dense weight tables and positive-only weight tables (the fork's
@@ -84,12 +168,12 @@ def test_positive_rows_layout_gives_same_diff(monkeypatch, taz_order):
     zone summaries, with ``_diff == _result - _control`` row by row, also when the
     control table is not sorted."""
     settings = patch_settings(monkeypatch)
-    problem = _summarize_problem()
+    problem = summarize_problem()
     controls = problem[3]
     controls["TAZ"] = controls["TAZ"].loc[taz_order]
 
-    dense = _run_summarize(monkeypatch, settings, problem, False)
-    positive = _run_summarize(monkeypatch, settings, problem, True)
+    dense = run_summarize(monkeypatch, settings, problem, False)
+    positive = run_summarize(monkeypatch, settings, problem, True)
 
     zone_tables = [
         n for n in dense if n not in ("hh_weights",) and "aggregate" not in n
