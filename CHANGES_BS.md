@@ -2,6 +2,10 @@
 
 Base: upstream tag `v0.10.0`. Every new setting defaults to upstream behaviour.
 
+## 0.10.0+bs.3 (unreleased)
+
+- Correct: `_diff` columns of the zone summaries were subtracted by position; now by zone id.
+
 ## 0.10.0+bs.2
 
 - Add `INTEGERIZER_ROUNDING` (`round` default, `controlled`): the controlled rounding of the simultaneous integerizer places every household row as often as its parent weight says, gives every zone its household count (as far as the household counts and the row sums allow, shortfalls are counted) and lowers the importance-weighted distance of the integer to the float cell totals (`lp` solves a linear relaxation to its optimum and then rounds fractional values jointly, `search` ends in a local optimum). `round` is upstream's rounding and equals `0.10.0+bs.1`.

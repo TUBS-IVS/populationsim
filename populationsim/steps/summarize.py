@@ -154,6 +154,11 @@ def summarize_geography(
 
     Fork: ``layout`` (:class:`_DenseLayout`, only with
     ``STORE_POSITIVE_WEIGHT_ROWS_ONLY``) fills the zones the dense table held.
+
+    Fork: the rows are the controlled zones in the order of the control table;
+    ``_result`` and ``_diff = _result - _control`` are aligned to them by zone
+    id (upstream subtracted the sorted results by position). A controlled zone
+    without weight rows gets result 0.
     """
 
     # controls_table for current geography level
@@ -197,6 +202,19 @@ def summarize_geography(
         summary_df = _zero_filled_zones(
             summary_df, zone_ids, layout.zone_ids(geography)
         )
+
+    # Fork: align the results to the controls by zone id. ``groupby`` gives the
+    # zones sorted, the controls are in the order of the control table, and the
+    # difference below is taken by position. A zone with controls but no weight
+    # rows gets result 0 (as the all-empty case above), so its diff is -control.
+    # Counted after the layout fill, so the count is that of the dense table.
+    with_rows = int(zone_ids.isin(summary_df.index).sum())
+    logger.info(
+        "summarizing %s: %d/%d controlled zones in the weight table, "
+        "%d not in it (result 0)"
+        % (geography, with_rows, len(zone_ids), len(zone_ids) - with_rows)
+    )
+    summary_df = summary_df.reindex(zone_ids, fill_value=0)
 
     controls_df = pd.DataFrame(
         data=np.asanyarray(controls),
@@ -312,7 +330,9 @@ def summarize(crosswalk, incidence_table, control_spec):
     hold only their positive rows; the step fills zeros for the households and
     zones the dense table held (:class:`_DenseLayout`), so the summary tables have
     the rows and columns of a run with the setting off and a household or zone
-    that was never balanced stays missing. A zero term adds nothing to an exact
+    that was never balanced stays missing (except that ``summarize_geography``
+    gives every controlled zone a row, result 0 without weight rows, with the
+    setting off as on). A zero term adds nothing to an exact
     sum, but pandas' grouped sum is compensated, so dropping the zero rows can
     change the last bit of a float sum: the summary tables can differ from those
     of a run with the setting off in the last bits of float sums (equal in the
