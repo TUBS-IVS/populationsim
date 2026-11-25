@@ -774,3 +774,288 @@ def test_example_with_numba_and_both_run_time_options_equals_both_off(tmp_path):
     assert sparse
     for name in sparse + ["expanded_household_ids"]:
         _assert_same_table(on_tables[name], off_tables[name])
+
+
+# --- D. result frames of the integerizers (reshape_result) -----------------------
+
+
+def _reshape_inputs(
+    zone_count,
+    household_count=40,
+    seed=0,
+    zero_zone=None,
+    integer_dtype=np.int64,
+    id_dtype=np.int64,
+):
+    """Float and integer weights, one column per zone, hh ids unsorted and named."""
+    rng = np.random.RandomState(seed)
+    ids = rng.permutation(household_count * 3)[:household_count].astype(id_dtype)
+    index = pd.Index(ids, name="hh_id")
+    names = ["zone_%d" % (i + 1) for i in range(zone_count)]
+    float_values = np.where(
+        rng.rand(household_count, zone_count) < 0.2,
+        rng.rand(household_count, zone_count) * 5.0,
+        0.0,
+    )
+    integer_values = np.where(float_values > 2.5, np.round(float_values), 0.0)
+    # a row positive in the integer weight only and one in the float weight only
+    float_values[0, 0] = 0.0
+    integer_values[0, 0] = 1.0
+    float_values[1, 0] = 0.25
+    integer_values[1, 0] = 0.0
+    if zero_zone is not None:
+        float_values[:, zero_zone] = 0.0
+        integer_values[:, zero_zone] = 0.0
+    float_weights = pd.DataFrame(float_values, index=index, columns=names)
+    integerized = pd.DataFrame(
+        integer_values.astype(integer_dtype), index=index, columns=names
+    )
+    return float_weights, integerized, names
+
+
+def _zones(names, zone_type):
+    return pd.Series(names, index=[zone_type(10 + 3 * i) for i in range(len(names))])
+
+
+def _run_reshape(settings, fast, float_weights, integerized, zones, positive):
+    """(result, tally) of the upstream loop (fast=False) or of the fast build."""
+    from populationsim.core import positive_weight_rows as pwr
+    from populationsim.integerizing import wrappers as iw
+
+    pwr._TALLY.clear()
+    try:
+        if fast:
+            result = iw._reshape_result_fast(
+                float_weights, integerized, "TAZ", zones, positive
+            )
+        else:
+            settings.clear()
+            settings.update(
+                {SETTING: False, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive}
+            )
+            result = iw.reshape_result(float_weights, integerized, "TAZ", zones)
+        return result, dict(pwr._TALLY)
+    finally:
+        pwr._TALLY.clear()
+
+
+def _assert_reshape_equal(settings, float_weights, integerized, zones, positive):
+    up, up_tally = _run_reshape(
+        settings, False, float_weights, integerized, zones, positive
+    )
+    fast, fast_tally = _run_reshape(
+        settings, True, float_weights, integerized, zones, positive
+    )
+    pd.testing.assert_frame_equal(
+        fast, up, check_exact=True, check_index_type=True, check_column_type=True
+    )
+    assert list(fast.columns) == list(up.columns)
+    assert fast.index.dtype == up.index.dtype
+    assert list(fast.dtypes) == list(up.dtypes)
+    assert fast_tally == up_tally
+    assert bool(up_tally) == positive  # the tally is part of what is compared
+    return up
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("zone_type", [int, np.int64, np.int32])
+@pytest.mark.parametrize("zone_count", [1, 7])
+@pytest.mark.parametrize("integer_dtype", [np.int64, np.float64])
+def test_reshape_result_fast_equals_upstream(
+    settings, positive, zone_type, zone_count, integer_dtype
+):
+    float_weights, integerized, names = _reshape_inputs(
+        zone_count, seed=zone_count, integer_dtype=integer_dtype
+    )
+    zones = _zones(names, zone_type)
+    values = float_weights.to_numpy()
+    assert (values > 0).any() and (values == 0).any()  # the filter has work to do
+    _assert_reshape_equal(settings, float_weights, integerized, zones, positive)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+def test_reshape_result_fast_keeps_an_all_zero_zone(settings, positive):
+    float_weights, integerized, names = _reshape_inputs(5, seed=3, zero_zone=2)
+    result = _assert_reshape_equal(
+        settings, float_weights, integerized, _zones(names, int), positive
+    )
+    assert (result["TAZ"] == 16).sum() == (0 if positive else 40)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("zone_count", [1, 4])
+def test_reshape_result_fast_with_nothing_positive_keeps_the_dense_dtypes(
+    settings, positive, zone_count
+):
+    float_weights, integerized, names = _reshape_inputs(zone_count)
+    float_weights[:] = 0.0
+    integerized[:] = 0
+    result = _assert_reshape_equal(
+        settings, float_weights, integerized, _zones(names, int), positive
+    )
+    assert len(result.index) == (0 if positive else 40 * zone_count)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("id_kind", ["int64", "int32", "object", "descending"])
+def test_reshape_result_fast_keeps_the_household_id_dtype(settings, positive, id_kind):
+    float_weights, integerized, names = _reshape_inputs(3, seed=5)
+    if id_kind == "object":
+        index = pd.Index(["h%d" % i for i in range(40)], name="hh_id")
+    elif id_kind == "int32":
+        index = pd.Index(np.arange(40, 0, -1).astype(np.int32), name="hh_id")
+    elif id_kind == "descending":
+        index = pd.Index(np.arange(40, 0, -1), name="hh_id")
+    else:
+        index = pd.Index(np.arange(40, dtype=np.int64) * 7, name="hh_id")
+    float_weights.index = index
+    integerized.index = index
+    _assert_reshape_equal(
+        settings, float_weights, integerized, _zones(names, int), positive
+    )
+
+
+def test_reshape_result_fast_repeated_zone_id_overwrites_its_tally_entry(settings):
+    float_weights, integerized, names = _reshape_inputs(3, seed=8)
+    zones = pd.Series(names, index=[10, 20, 10])
+    _assert_reshape_equal(settings, float_weights, integerized, zones, True)
+
+
+# an integer weight table cannot hold NaN (astype(int) refuses it), so no such case
+@pytest.mark.parametrize(
+    "bad, column", [(np.nan, "float"), (-1.0, "float"), (-1.0, "integer")]
+)
+@pytest.mark.parametrize("bad_zone", [0, 2])
+def test_reshape_result_fast_raises_the_upstream_error_and_leaves_its_tally(
+    settings, bad, column, bad_zone
+):
+    float_weights, integerized, names = _reshape_inputs(4, seed=2)
+    if column == "float":
+        float_weights.iloc[3, bad_zone] = bad
+    else:
+        integerized.iloc[3, bad_zone] = bad
+    # a second, later offender must not change which zone is reported
+    float_weights.iloc[5, 3] = -2.0
+    zones = _zones(names, int)
+
+    outcomes = []
+    for fast in (False, True):
+        try:
+            _run_reshape(settings, fast, float_weights, integerized, zones, True)
+        except ValueError as error:
+            outcomes.append(str(error))
+    assert len(outcomes) == 2 and outcomes[0] == outcomes[1]
+    assert "zone %d " % (10 + 3 * bad_zone) in outcomes[0]
+
+
+def _tally_after_error(settings, fast, float_weights, integerized, zones):
+    from populationsim.core import positive_weight_rows as pwr
+    from populationsim.integerizing import wrappers as iw
+
+    pwr._TALLY.clear()
+    settings.update({SETTING: False, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": True})
+    try:
+        with pytest.raises(ValueError):
+            if fast:
+                iw._reshape_result_fast(float_weights, integerized, "TAZ", zones, True)
+            else:
+                iw.reshape_result(float_weights, integerized, "TAZ", zones)
+        return dict(pwr._TALLY)
+    finally:
+        pwr._TALLY.clear()
+
+
+@pytest.mark.parametrize("bad_zone", [0, 1, 3])
+def test_reshape_result_fast_counts_the_zones_before_an_offender_like_upstream(
+    settings, bad_zone
+):
+    float_weights, integerized, names = _reshape_inputs(4, seed=2)
+    float_weights.iloc[3, bad_zone] = np.nan
+    zones = _zones(names, int)
+    upstream = _tally_after_error(settings, False, float_weights, integerized, zones)
+    fast = _tally_after_error(settings, True, float_weights, integerized, zones)
+    assert len(upstream) == bad_zone
+    assert fast == upstream
+
+
+def test_reshape_result_fast_checks_columns_in_upstream_order(settings):
+    """Within a zone: balanced_weight before integer_weight, NaN before negative."""
+    float_weights, integerized, names = _reshape_inputs(3, seed=4)
+    zones = _zones(names, int)
+    float_weights.iloc[2, 1] = -1.0
+    integerized.iloc[3, 1] = -1
+    messages = []
+    for fast in (False, True):
+        try:
+            _run_reshape(settings, fast, float_weights, integerized, zones, True)
+        except ValueError as error:
+            messages.append(str(error))
+    assert len(messages) == 2 and messages[0] == messages[1]
+    assert "column balanced_weight" in messages[0] and "negative" in messages[0]
+
+    float_weights.iloc[2, 1] = 0.0
+    float_weights.iloc[4, 1] = np.nan
+    integerized.iloc[3, 1] = -1
+    messages = []
+    for fast in (False, True):
+        try:
+            _run_reshape(settings, fast, float_weights, integerized, zones, True)
+        except ValueError as error:
+            messages.append(str(error))
+    assert len(messages) == 2 and messages[0] == messages[1]
+    assert "NaN" in messages[0]
+
+
+def test_reshape_result_dispatches_on_fast_paths(settings, monkeypatch):
+    from populationsim.integerizing import wrappers as iw
+
+    float_weights, integerized, names = _reshape_inputs(3, seed=6)
+    zones = _zones(names, int)
+    calls = []
+    real = iw._reshape_result_fast
+
+    def spy(*args):
+        calls.append(args[-1])
+        return real(*args)
+
+    monkeypatch.setattr(iw, "_reshape_result_fast", spy)
+    for fast, positive in [(False, False), (True, False), (True, True)]:
+        settings.clear()
+        settings.update({SETTING: fast, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+        iw.reshape_result(float_weights, integerized, "TAZ", zones)
+    assert calls == [False, True]
+
+
+@pytest.mark.parametrize("positive", [False, True])
+def test_reshape_result_without_households_is_the_upstream_result(settings, positive):
+    """No rows: equal to upstream (the upstream loop builds it)."""
+    from populationsim.integerizing import wrappers as iw
+
+    float_weights, integerized, names = _reshape_inputs(2, seed=1)
+    zones = _zones(names, int)
+    results = []
+    for fast in (True, False):
+        settings.clear()
+        settings.update({SETTING: fast, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+        results.append(
+            iw.reshape_result(
+                float_weights.iloc[:0], integerized.iloc[:0], "TAZ", zones
+            )
+        )
+    pd.testing.assert_frame_equal(results[0], results[1], check_exact=True)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+def test_reshape_result_without_zones_fails_like_upstream(settings, positive):
+    from populationsim.integerizing import wrappers as iw
+
+    float_weights, integerized, _ = _reshape_inputs(2, seed=1)
+    zones = _zones([], int)
+    errors = []
+    for fast in (True, False):
+        settings.clear()
+        settings.update({SETTING: fast, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+        with pytest.raises((ValueError, IndexError)) as error:
+            iw.reshape_result(float_weights[[]], integerized[[]], "TAZ", zones)
+        errors.append((type(error.value), str(error.value)))
+    assert errors[0] == errors[1]

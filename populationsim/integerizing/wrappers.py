@@ -4,7 +4,10 @@ import pandas as pd
 
 from populationsim.core import config
 from populationsim.core import positive_weight_rows
-from populationsim.core.bs_run_options import store_positive_weight_rows_only
+from populationsim.core.bs_run_options import (
+    fast_paths,
+    store_positive_weight_rows_only,
+)
 from populationsim.integerizing.single_integerizer import Integerizer
 from populationsim.integerizing.simul_integerizer import SimulIntegerizer
 from populationsim.integerizing import path_record
@@ -116,6 +119,67 @@ def try_simul_integerizing(
     return status, integerized_weights_df
 
 
+def _reshape_result_fast(
+    float_weights, integerized_weights, sub_geography, sub_control_zones, positive_only
+):
+    """Fork fast path of :func:`reshape_result` (setting ``FAST_PATHS``).
+
+    Builds the result in one pass over whole arrays instead of one small
+    ``DataFrame`` per zone, which is where upstream spends its time when a parent
+    has many sub-zones. The frame is equal to the upstream one under
+    ``assert_frame_equal(check_exact=True)``: rows in zone-major order, the index
+    ``0..N-1`` repeated per zone (kept labels only with ``positive_only``), the
+    columns in upstream's order and the dtypes upstream's per-zone assignments
+    give (the zone column from the zone ids, ``integer_weight`` from the same
+    ``astype(int)``, the household ids from ``float_weights.index``). With
+    ``positive_only`` the positive-row filter is one mask, and its checks, error
+    messages and per-zone tally are those of
+    :func:`populationsim.core.positive_weight_rows.keep_positive_rows`
+    (:func:`~populationsim.core.positive_weight_rows.positive_row_mask`). All zones
+    empty keeps the dense columns and dtypes, as ``concat_kept`` does.
+
+    The caller guarantees at least one zone and one household.
+    """
+    zone_ids = list(sub_control_zones.index)
+    zone_names = list(sub_control_zones.values)
+    zone_count = len(zone_ids)
+    household_count = len(float_weights.index)
+
+    # one row per zone, one column per household: C order is zone-major
+    balanced = float_weights[zone_names].to_numpy().T
+    integer = integerized_weights[zone_names].astype(int).to_numpy().T
+
+    if positive_only:
+        keep = positive_weight_rows.positive_row_mask(
+            zone_ids,
+            {"balanced_weight": balanced, "integer_weight": integer},
+        ).ravel()
+    else:
+        keep = None
+
+    position = np.tile(np.arange(household_count, dtype=np.int64), zone_count)
+    # the dtype of a scalar zone id assigned to a column (int -> int64, np.int32 ->
+    # int32, ...): build it as a Series of the ids, which infers the same
+    zone_column = pd.Series(zone_ids).to_numpy().repeat(household_count)
+    balanced = np.ascontiguousarray(balanced).ravel()
+    integer = np.ascontiguousarray(integer).ravel()
+    if keep is not None:
+        position = position[keep]
+        zone_column = zone_column[keep]
+        balanced = balanced[keep]
+        integer = integer[keep]
+
+    return pd.DataFrame(
+        {
+            float_weights.index.name: float_weights.index.take(position),
+            sub_geography: zone_column,
+            "balanced_weight": balanced,
+            "integer_weight": integer,
+        },
+        index=pd.Index(position),
+    )
+
+
 def reshape_result(
     float_weights, integerized_weights, sub_geography, sub_control_zones
 ):
@@ -143,6 +207,20 @@ def reshape_result(
     """
 
     positive_only = store_positive_weight_rows_only()
+
+    if fast_paths():
+        if len(sub_control_zones) > 0 and len(float_weights.index) > 0:
+            return _reshape_result_fast(
+                float_weights,
+                integerized_weights,
+                sub_geography,
+                sub_control_zones,
+                positive_only,
+            )
+        # not a fallback (no logger call here: tests/test_path_record.py pins the
+        # logger calls of this module to upstream's): no zone or no household is no
+        # case the whole-array build is made for; the upstream loop below gives its
+        # result (or its error) for them
 
     # integerize the sub_zone weights
     integer_weights_list = []
