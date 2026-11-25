@@ -486,6 +486,104 @@ def test_fast_draw_equals_upstream_choice(int_sample_weights):
     _assert_same_rng_state(fast_rng, upstream_rng)
 
 
+def _batch_case(weight_dtype, seed=21, groups=4000, rows=6000, max_size=40):
+    """A batch-like case: many groups, few of them used, many rows per group.
+
+    float32 weights are made as parts of 16 (a power of two), so that the
+    normalised float32 probabilities sum to 1 exactly and upstream's own check
+    of the probabilities accepts them; the groups then have 1 to 8 households.
+    """
+    rng = np.random.RandomState(seed)
+    if np.dtype(weight_dtype) == np.float32:
+        group_id, weight = [], []
+        for group in range(groups):
+            k = rng.randint(1, 9)
+            cuts = np.sort(rng.choice(np.arange(1, 16), size=k - 1, replace=False))
+            parts = np.diff(np.concatenate([[0], cuts, [16]]))
+            group_id += [group] * k
+            weight += parts.tolist()
+        group_id = np.array(group_id, dtype=np.int64)
+        weight = np.array(weight)
+        order = rng.permutation(len(group_id))
+        group_id, weight = group_id[order], weight[order]
+    else:
+        sizes = rng.randint(1, max_size + 1, size=groups)
+        group_id = np.repeat(np.arange(groups, dtype=np.int64), sizes)
+        rng.shuffle(group_id)
+        weight = rng.random_sample(len(group_id)) * 250.0 + 1e-3
+        if np.dtype(weight_dtype).kind in "iu":
+            weight = rng.randint(1, 300, size=len(group_id))
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": np.arange(len(group_id), dtype=np.int64) * 3 + 5,
+            "group_id": group_id,
+            "sample_weight": np.asarray(weight).astype(weight_dtype),
+        }
+    )
+    used = rng.choice(groups, size=groups // 3, replace=False)
+    group_ids = np.sort(rng.choice(used, size=rows))
+    return household_groups, group_ids
+
+
+@pytest.mark.parametrize(
+    "weight_dtype, max_size",
+    [(np.float64, 40), (np.int64, 40), (np.int32, 40), (np.float32, 8)],
+)
+def test_fast_draw_equals_upstream_choice_on_a_batch_like_case(weight_dtype, max_size):
+    """Draws, dtype and next random number equal upstream's per-row choice for
+    float and integer weights (float32 on small groups, where upstream's own
+    normalisation check holds)."""
+    household_groups, group_ids = _batch_case(weight_dtype, max_size=max_size)
+    upstream_rng = np.random.RandomState([11, 42])
+    fast_rng = np.random.RandomState([11, 42])
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    got = eh.draw_household_ids(
+        group_ids.astype(object), household_groups, "hh_id", fast_rng
+    )
+    assert len(np.unique(group_ids)) > 1000
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(fast_rng, upstream_rng)
+
+
+@pytest.mark.parametrize(
+    "id_dtype, big_group",
+    [
+        (np.int64, None),
+        (np.int64, "used"),
+        (np.int64, "unused"),
+        (np.int32, None),
+        (np.uint8, None),
+        (np.float64, None),
+    ],
+)
+def test_fast_draw_id_dtype_follows_upstream_for_the_used_groups(id_dtype, big_group):
+    """The dtype comes from the groups that are drawn from: an id beyond the
+    default integer in a used group widens it to int64 (as upstream's list of ids
+    does), the same id in an unused group does not; non-int64 id columns give the
+    dtype of the list of their Python values."""
+    group = np.array([0, 0, 1, 1, 2, 3, 3, 3])
+    ids = np.array([10, 11, 12, 13, 14, 15, 16, 17], dtype=np.int64)
+    household_groups = pd.DataFrame(
+        {"hh_id": ids, "group_id": group, "sample_weight": np.arange(1.0, 9.0)}
+    )
+    if big_group is not None:
+        household_groups.loc[2, "hh_id"] = 2**40
+    household_groups["hh_id"] = household_groups["hh_id"].astype(id_dtype)
+    drawn = [0, 3, 0, 1, 3] if big_group != "unused" else [0, 3, 0, 3, 2, 3]
+    if big_group == "unused":
+        household_groups = household_groups.copy()
+        household_groups.loc[household_groups.group_id == 1, "hh_id"] = 2**40
+        household_groups["hh_id"] = household_groups["hh_id"].astype(id_dtype)
+    group_ids = np.array(drawn * 10)
+    expected = _upstream_draw(household_groups, group_ids, np.random.RandomState(9))
+    got = eh.draw_household_ids(
+        group_ids, household_groups, "hh_id", np.random.RandomState(9)
+    )
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+
+
 def test_fast_draw_takes_a_singleton_group_and_zero_weights_like_upstream():
     household_groups = pd.DataFrame(
         {
