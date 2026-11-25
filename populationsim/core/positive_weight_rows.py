@@ -91,21 +91,86 @@ def keep_positive_rows(zone_weights_df, zone_id):
     keep = np.zeros(len(zone_weights_df.index), dtype=bool)
     for column in columns:
         values = zone_weights_df[column].to_numpy()
-        nan_count = int(pd.isna(values).sum())
-        if nan_count:
-            raise ValueError(
-                "zone %s has %d NaN weights in column %s; refusing to drop rows"
-                % (zone_id, nan_count, column)
-            )
-        negative_count = int((values < 0).sum())
-        if negative_count:
-            raise ValueError(
-                "zone %s has %d negative weights in column %s; refusing to drop rows"
-                % (zone_id, negative_count, column)
-            )
+        _check_weights(
+            zone_id,
+            column,
+            int(pd.isna(values).sum()),
+            int((values < 0).sum()),
+        )
         keep |= values > 0
     _TALLY[_SCOPE + (zone_id,)] = (int(keep.sum()), len(keep))
     return zone_weights_df[keep]
+
+
+def _check_weights(zone_id, column, nan_count, negative_count):
+    """Raise the ``ValueError`` for a NaN or negative weight (NaN first)."""
+    if nan_count:
+        raise ValueError(
+            "zone %s has %d NaN weights in column %s; refusing to drop rows"
+            % (zone_id, nan_count, column)
+        )
+    if negative_count:
+        raise ValueError(
+            "zone %s has %d negative weights in column %s; refusing to drop rows"
+            % (zone_id, negative_count, column)
+        )
+
+
+def positive_row_mask(zone_ids, weights_by_column):
+    """:func:`keep_positive_rows` for several zones at once, on weight arrays.
+
+    Parameters
+    ----------
+    zone_ids : sequence
+        the zone ids, in the order the zones are stored
+    weights_by_column : dict
+        for each of :data:`WEIGHT_COLUMNS` to check, in that order, a 2-D array
+        with one row per zone and one column per household
+
+    Returns
+    -------
+    numpy.ndarray
+        boolean array of the same shape: the rows
+        :func:`keep_positive_rows` would keep.
+
+    The result and the side effects are those of calling :func:`keep_positive_rows`
+    zone by zone: the kept and total counts of every zone go into the tally, and
+    the first offending zone in zone order raises the same ``ValueError`` (checking
+    the columns in order, NaN before negative), after the zones before it have
+    been counted.
+    """
+    keep = None
+    nan_counts = {}
+    negative_counts = {}
+    for column, values in weights_by_column.items():
+        nan_counts[column] = pd.isna(values).sum(axis=1)
+        negative_counts[column] = (values < 0).sum(axis=1)
+        positive = values > 0
+        keep = positive if keep is None else keep | positive
+    if keep is None:
+        raise ValueError(
+            "weight frame has none of the columns %s" % (list(WEIGHT_COLUMNS),)
+        )
+    kept_counts = keep.sum(axis=1)
+    household_count = keep.shape[1]
+    invalid = np.zeros(len(zone_ids), dtype=bool)
+    for column in weights_by_column:
+        invalid |= (nan_counts[column] > 0) | (negative_counts[column] > 0)
+    first_invalid = int(invalid.argmax()) if invalid.any() else len(zone_ids)
+    for position in range(first_invalid):
+        _TALLY[_SCOPE + (zone_ids[position],)] = (
+            int(kept_counts[position]),
+            household_count,
+        )
+    if first_invalid < len(zone_ids):
+        for column in weights_by_column:
+            _check_weights(
+                zone_ids[first_invalid],
+                column,
+                int(nan_counts[column][first_invalid]),
+                int(negative_counts[column][first_invalid]),
+            )
+    return keep
 
 
 def concat_kept(frames):

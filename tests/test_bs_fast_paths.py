@@ -447,56 +447,341 @@ def _assert_rng_advanced(rng):
     )
 
 
-def test_expansion_fast_lists_equal_upstream_lists():
-    """The per-group id and probability lists equal upstream's, for every used group."""
-    household_groups, weights = _expansion_tables(500, 40, seed=5)
-    upstream = {}
+def _upstream_draw(household_groups, group_ids, rng):
+    """Upstream's draw, as ``expand_households`` runs it with FAST_PATHS off."""
+    lists = {}
     for group_id, df in household_groups.groupby("group_id"):
-        upstream[group_id] = [
+        lists[group_id] = [
             list(df["hh_id"]),
             list(df.sample_weight / df.sample_weight.sum()),
         ]
-    used = weights["hh_id"].unique()
-    fast = eh.household_lists_for_groups(household_groups, used, "hh_id")
-    assert sorted(fast) == sorted(int(g) for g in used)
-    for group_id, (ids, probs) in fast.items():
-        assert ids == upstream[group_id][0]
-        assert [type(i) for i in ids] == [type(i) for i in upstream[group_id][0]]
-        assert np.array_equal(np.array(probs), np.array(upstream[group_id][1]))
-        assert [type(p) for p in probs] == [type(p) for p in upstream[group_id][1]]
+
+    def chooser(group_id):
+        return rng.choice(lists[group_id][0], p=lists[group_id][1])
+
+    return pd.Series(group_ids).apply(chooser)
 
 
-def _lists(household_groups, used):
-    lists = eh.household_lists_for_groups(household_groups, used, "hh_id")
-    return {int(group_id): value for group_id, value in lists.items()}
+@pytest.mark.parametrize("int_sample_weights", [False, True])
+def test_fast_draw_equals_upstream_choice(int_sample_weights):
+    """Same ids, same dtype and the same next random number as a per-row
+    ``RandomState.choice``, on groups that recur in many rows and have 1 to
+    20,000 households."""
+    household_groups, weights = _expansion_tables(
+        500, 40, seed=5, int_sample_weights=int_sample_weights
+    )
+    group_ids = np.repeat(
+        weights["hh_id"].to_numpy(), weights["integer_weight"].to_numpy()
+    )
+    group_ids = np.random.RandomState(1).permutation(np.tile(group_ids, 20))
+    upstream_rng = np.random.RandomState([11, 42])
+    fast_rng = np.random.RandomState([11, 42])
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    got = eh.draw_household_ids(
+        pd.Series(group_ids.astype(object)), household_groups, "hh_id", fast_rng
+    )
+    assert len(got) == len(group_ids) > 1000
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(fast_rng, upstream_rng)
+
+
+def _batch_case(weight_dtype, seed=21, groups=4000, rows=6000, max_size=40):
+    """A batch-like case: many groups, few of them used, many rows per group.
+
+    float32 weights are made as parts of 16 (a power of two), so that the
+    normalised float32 probabilities sum to 1 exactly and upstream's own check
+    of the probabilities accepts them; the groups then have 1 to 8 households.
+    """
+    rng = np.random.RandomState(seed)
+    if np.dtype(weight_dtype) == np.float32:
+        group_id, weight = [], []
+        for group in range(groups):
+            k = rng.randint(1, 9)
+            cuts = np.sort(rng.choice(np.arange(1, 16), size=k - 1, replace=False))
+            parts = np.diff(np.concatenate([[0], cuts, [16]]))
+            group_id += [group] * k
+            weight += parts.tolist()
+        group_id = np.array(group_id, dtype=np.int64)
+        weight = np.array(weight)
+        order = rng.permutation(len(group_id))
+        group_id, weight = group_id[order], weight[order]
+    else:
+        sizes = rng.randint(1, max_size + 1, size=groups)
+        group_id = np.repeat(np.arange(groups, dtype=np.int64), sizes)
+        rng.shuffle(group_id)
+        weight = rng.random_sample(len(group_id)) * 250.0 + 1e-3
+        if np.dtype(weight_dtype).kind in "iu":
+            weight = rng.randint(1, 300, size=len(group_id))
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": np.arange(len(group_id), dtype=np.int64) * 3 + 5,
+            "group_id": group_id,
+            "sample_weight": np.asarray(weight).astype(weight_dtype),
+        }
+    )
+    used = rng.choice(groups, size=groups // 3, replace=False)
+    group_ids = np.sort(rng.choice(used, size=rows))
+    return household_groups, group_ids
+
+
+@pytest.mark.parametrize(
+    "weight_dtype, max_size",
+    [(np.float64, 40), (np.int64, 40), (np.int32, 40), (np.float32, 8)],
+)
+def test_fast_draw_equals_upstream_choice_on_a_batch_like_case(weight_dtype, max_size):
+    """Draws, dtype and next random number equal upstream's per-row choice for
+    float and integer weights (float32 on small groups, where upstream's own
+    normalisation check holds)."""
+    household_groups, group_ids = _batch_case(weight_dtype, max_size=max_size)
+    upstream_rng = np.random.RandomState([11, 42])
+    fast_rng = np.random.RandomState([11, 42])
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    got = eh.draw_household_ids(
+        group_ids.astype(object), household_groups, "hh_id", fast_rng
+    )
+    assert len(np.unique(group_ids)) > 1000
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(fast_rng, upstream_rng)
+
+
+@pytest.mark.parametrize(
+    "id_dtype, big_group",
+    [
+        (np.int64, None),
+        (np.int64, "used"),
+        (np.int64, "unused"),
+        (np.int32, None),
+        (np.uint8, None),
+        (np.float64, None),
+    ],
+)
+def test_fast_draw_id_dtype_follows_upstream_for_the_used_groups(id_dtype, big_group):
+    """The dtype comes from the groups that are drawn from: an id beyond the
+    default integer in a used group widens it to int64 (as upstream's list of ids
+    does), the same id in an unused group does not; non-int64 id columns give the
+    dtype of the list of their Python values."""
+    group = np.array([0, 0, 1, 1, 2, 3, 3, 3])
+    ids = np.array([10, 11, 12, 13, 14, 15, 16, 17], dtype=np.int64)
+    household_groups = pd.DataFrame(
+        {"hh_id": ids, "group_id": group, "sample_weight": np.arange(1.0, 9.0)}
+    )
+    if big_group is not None:
+        household_groups.loc[2, "hh_id"] = 2**40
+    household_groups["hh_id"] = household_groups["hh_id"].astype(id_dtype)
+    drawn = [0, 3, 0, 1, 3] if big_group != "unused" else [0, 3, 0, 3, 2, 3]
+    if big_group == "unused":
+        household_groups = household_groups.copy()
+        household_groups.loc[household_groups.group_id == 1, "hh_id"] = 2**40
+        household_groups["hh_id"] = household_groups["hh_id"].astype(id_dtype)
+    group_ids = np.array(drawn * 10)
+    expected = _upstream_draw(household_groups, group_ids, np.random.RandomState(9))
+    got = eh.draw_household_ids(
+        group_ids, household_groups, "hh_id", np.random.RandomState(9)
+    )
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+
+
+def test_fast_draw_with_string_group_ids_equals_upstream_and_logs(caplog, fork_logging):
+    """A string group column (any dtype that sorts) works through the draw and
+    its log line, with the draws and the next random number of upstream's."""
+    import logging
+
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [10, 11, 12, 13, 14, 15],
+            "group_id": ["b", "a", "b", "c", "a", "b"],
+            "sample_weight": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    group_ids = np.array(["b", "c", "a", "b", "b", "a", "c"] * 20, dtype=object)
+    upstream_rng = np.random.RandomState(5)
+    fast_rng = np.random.RandomState(5)
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    with caplog.at_level(logging.INFO, logger=eh.logger.name):
+        got = eh.draw_household_ids(group_ids, household_groups, "hh_id", fast_rng)
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(fast_rng, upstream_rng)
+    lines = [r.getMessage() for r in caplog.records if "FAST_PATHS" in r.getMessage()]
+    assert len(lines) == 1 and "from 3 of 3 incidence groups" in lines[0]
+
+
+def test_fast_draw_takes_a_singleton_group_and_zero_weights_like_upstream():
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [10, 11, 12, 13, 14],
+            "group_id": [3, 0, 3, 3, 7],
+            "sample_weight": [0.5, 2.0, 0.0, 1.5, 4.0],
+        }
+    )
+    group_ids = np.array([3, 7, 0, 3, 3, 7, 7, 0, 3] * 50)
+    upstream_rng = np.random.RandomState(8)
+    fast_rng = np.random.RandomState(8)
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    got = eh.draw_household_ids(
+        pd.Series(group_ids), household_groups, "hh_id", fast_rng
+    )
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert 12 not in set(got.tolist())
+    _assert_same_rng_state(fast_rng, upstream_rng)
 
 
 @pytest.mark.parametrize("dtype", [object, np.float64, np.int32])
-def test_expansion_lists_do_not_depend_on_the_dtype_of_the_used_ids(dtype):
+def test_fast_draw_does_not_depend_on_the_dtype_of_the_group_ids(dtype):
     """The step hands over an object array of group ids (the expanded table is
     built from mixed dtypes); object, float and int ids select the same groups
-    and give the same lists as int64 ids."""
+    and draw the same households as int64 ids."""
     household_groups, weights = _expansion_tables(300, 30, seed=3)
     used = weights["hh_id"].to_numpy()
-    expected = _lists(household_groups, used)
-    assert len(expected) > 0
-    got = _lists(household_groups, used.astype(dtype))
-    assert list(got) == list(expected)
-    for group_id, (ids, probs) in expected.items():
-        assert got[group_id][0] == ids
-        assert np.array_equal(np.array(got[group_id][1]), np.array(probs))
+    reference = eh.draw_household_ids(
+        pd.Series(used), household_groups, "hh_id", np.random.RandomState(2)
+    )
+    got = eh.draw_household_ids(
+        pd.Series(used.astype(dtype)),
+        household_groups,
+        "hh_id",
+        np.random.RandomState(2),
+    )
+    np.testing.assert_array_equal(got, reference)
+    assert got.dtype == reference.dtype
 
 
 def test_expansion_refuses_a_group_id_the_cast_would_change():
     household_groups, weights = _expansion_tables(100, 10, seed=4)
     used = weights["hh_id"].to_numpy().astype(np.float64)
     used[0] = 2.5
+    rng = np.random.RandomState(1)
     with pytest.raises(ValueError, match="group id"):
-        eh.household_lists_for_groups(household_groups, used, "hh_id")
+        eh.draw_household_ids(pd.Series(used), household_groups, "hh_id", rng)
     with pytest.raises(ValueError, match="group id"):
-        eh.household_lists_for_groups(
-            household_groups, np.array([1, "x"], dtype=object), "hh_id"
+        eh.draw_household_ids(
+            pd.Series([1, "x"], dtype=object), household_groups, "hh_id", rng
         )
+    with pytest.raises(ValueError, match="group id"):
+        eh.draw_household_ids(
+            pd.Series([1.0, np.nan], dtype=object), household_groups, "hh_id", rng
+        )
+    # nothing was drawn before the refusal
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
+def test_fast_draw_refuses_a_group_without_households():
+    household_groups, weights = _expansion_tables(100, 10, seed=4)
+    rng = np.random.RandomState(1)
+    with pytest.raises(ValueError, match="group 100000"):
+        eh.draw_household_ids(pd.Series([100000]), household_groups, "hh_id", rng)
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
+@pytest.mark.parametrize(
+    "weights", [[0, 0], [-1, 2], [1, np.nan], [1, np.inf], [np.nan, np.nan]]
+)
+def test_fast_draw_names_a_group_with_invalid_weights(weights):
+    """Upstream fails inside ``RandomState.choice`` (a ValueError for negative or
+    non-normalised probabilities); the fast draw fails with a ValueError that
+    names the group, before it draws anything."""
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [1, 2, 3],
+            "group_id": [4, 4, 5],
+            "sample_weight": weights + [1.0],
+        }
+    )
+    rng = np.random.RandomState(1)
+    with pytest.raises(ValueError, match="group 4"):
+        eh.draw_household_ids(pd.Series([5, 4, 5]), household_groups, "hh_id", rng)
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
+@pytest.mark.parametrize("id_offset", [0, 2**40])
+def test_fast_draw_keeps_upstream_id_dtype(monkeypatch, id_offset):
+    """The fast draw returns the ``hh_id`` dtype the upstream path returns on this
+    platform (int32 on Windows with NumPy 1.x, which builds a Python list of ids
+    and lets ``RandomState.choice`` pick the default integer; int64 where the ids
+    do not fit), not the dtype of the id column."""
+    household_groups, weights = _expansion_tables(200, 20, seed=6)
+    household_groups["hh_id"] = household_groups["hh_id"] + id_offset
+    off, off_rng = _run_expand(monkeypatch, household_groups, weights, fast=False)
+    on, on_rng = _run_expand(monkeypatch, household_groups, weights, fast=True)
+    assert on["hh_id"].dtype == off["hh_id"].dtype
+    assert list(on.dtypes) == list(off.dtypes)
+    _assert_same_table(on, off)
+    _assert_same_rng_state(on_rng, off_rng)
+
+
+@pytest.mark.parametrize("dtype", [object, np.int64, np.float64])
+def test_fast_draw_of_no_rows_has_the_dtype_of_the_upstream_result(dtype):
+    """With no expanded row upstream's apply returns an empty Series of the dtype
+    of the group id Series (object in the step); the fast draw does the same and
+    draws nothing."""
+    household_groups, _ = _expansion_tables(50, 5, seed=2)
+    group_ids = np.array([], dtype=dtype)
+    expected = _upstream_draw(household_groups, group_ids, np.random.RandomState(3))
+    rng = np.random.RandomState(3)
+    got = eh.draw_household_ids(group_ids, household_groups, "hh_id", rng)
+    assert len(got) == 0
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(rng, np.random.RandomState(3))
+
+
+def test_expansion_with_no_rows_is_equal_on_and_off(monkeypatch):
+    household_groups, weights = _expansion_tables(50, 5, seed=2)
+    weights = weights.iloc[:0]
+    off, off_rng = _run_expand(monkeypatch, household_groups, weights, fast=False)
+    on, on_rng = _run_expand(monkeypatch, household_groups, weights, fast=True)
+    assert len(on) == 0
+    assert on["hh_id"].dtype == off["hh_id"].dtype
+    _assert_same_table(on, off)
+    _assert_same_rng_state(on_rng, off_rng)
+
+
+def test_fast_draw_names_the_first_invalid_group_in_row_order():
+    """Upstream's per-row choice fails at the first row whose group is invalid;
+    the group named is the one of that row, not the lowest id or the last one."""
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [1, 2, 3, 4, 5],
+            "group_id": [4, 5, 6, 7, 7],
+            "sample_weight": [0.0, 1.0, -1.0, 1.0, 1.0],
+        }
+    )
+    rng = np.random.RandomState(1)
+    with pytest.raises(ValueError, match="group 6"):
+        eh.draw_household_ids(
+            pd.Series([7, 5, 6, 4, 6]), household_groups, "hh_id", rng
+        )
+    with pytest.raises(ValueError, match="group 4"):
+        eh.draw_household_ids(pd.Series([7, 4, 6, 5]), household_groups, "hh_id", rng)
+    # a group without households counts the same way
+    with pytest.raises(ValueError, match="group 99"):
+        eh.draw_household_ids(pd.Series([5, 99, 6]), household_groups, "hh_id", rng)
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
+def test_expansion_off_path_does_not_use_the_fast_draw(monkeypatch):
+    household_groups, weights = _expansion_tables(100, 10, seed=7)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("draw_household_ids called with FAST_PATHS off")
+
+    monkeypatch.setattr(eh, "draw_household_ids", refuse)
+    off, _ = _run_expand(monkeypatch, household_groups, weights, fast=False)
+    assert len(off) == weights["integer_weight"].sum()
+    with pytest.raises(AssertionError, match="FAST_PATHS off"):
+        _run_expand(monkeypatch, household_groups, weights, fast=True)
+
+
+def test_expansion_fast_path_logs_its_batch(monkeypatch, caplog, fork_logging):
+    import logging
+
+    household_groups, weights = _expansion_tables(100, 10, seed=7)
+    with caplog.at_level(logging.INFO, logger=eh.logger.name):
+        _run_expand(monkeypatch, household_groups, weights, fast=True)
+    lines = [r.getMessage() for r in caplog.records if "FAST_PATHS" in r.getMessage()]
+    assert len(lines) == 1 and "batch" in lines[0]
 
 
 def test_expansion_without_grouping_is_unchanged(monkeypatch):
@@ -612,3 +897,363 @@ def test_example_with_numba_and_both_run_time_options_equals_both_off(tmp_path):
     assert sparse
     for name in sparse + ["expanded_household_ids"]:
         _assert_same_table(on_tables[name], off_tables[name])
+
+
+# --- D. result frames of the integerizers (reshape_result) -----------------------
+
+
+def _reshape_inputs(
+    zone_count,
+    household_count=40,
+    seed=0,
+    zero_zone=None,
+    integer_dtype=np.int64,
+    id_dtype=np.int64,
+):
+    """Float and integer weights, one column per zone, hh ids unsorted and named."""
+    rng = np.random.RandomState(seed)
+    ids = rng.permutation(household_count * 3)[:household_count].astype(id_dtype)
+    index = pd.Index(ids, name="hh_id")
+    names = ["zone_%d" % (i + 1) for i in range(zone_count)]
+    float_values = np.where(
+        rng.rand(household_count, zone_count) < 0.2,
+        rng.rand(household_count, zone_count) * 5.0,
+        0.0,
+    )
+    integer_values = np.where(float_values > 2.5, np.round(float_values), 0.0)
+    # a row positive in the integer weight only and one in the float weight only
+    float_values[0, 0] = 0.0
+    integer_values[0, 0] = 1.0
+    float_values[1, 0] = 0.25
+    integer_values[1, 0] = 0.0
+    if zero_zone is not None:
+        float_values[:, zero_zone] = 0.0
+        integer_values[:, zero_zone] = 0.0
+    float_weights = pd.DataFrame(float_values, index=index, columns=names)
+    integerized = pd.DataFrame(
+        integer_values.astype(integer_dtype), index=index, columns=names
+    )
+    return float_weights, integerized, names
+
+
+def _zones(names, zone_type):
+    return pd.Series(names, index=[zone_type(10 + 3 * i) for i in range(len(names))])
+
+
+def _run_reshape(settings, fast, float_weights, integerized, zones, positive):
+    """(result, tally) of the upstream loop (fast=False) or of the fast build."""
+    from populationsim.core import positive_weight_rows as pwr
+    from populationsim.integerizing import wrappers as iw
+
+    pwr._TALLY.clear()
+    try:
+        if fast:
+            result = iw._reshape_result_fast(
+                float_weights, integerized, "TAZ", zones, positive
+            )
+        else:
+            settings.clear()
+            settings.update(
+                {SETTING: False, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive}
+            )
+            result = iw.reshape_result(float_weights, integerized, "TAZ", zones)
+        return result, dict(pwr._TALLY)
+    finally:
+        pwr._TALLY.clear()
+
+
+def _assert_reshape_equal(settings, float_weights, integerized, zones, positive):
+    up, up_tally = _run_reshape(
+        settings, False, float_weights, integerized, zones, positive
+    )
+    fast, fast_tally = _run_reshape(
+        settings, True, float_weights, integerized, zones, positive
+    )
+    pd.testing.assert_frame_equal(
+        fast, up, check_exact=True, check_index_type=True, check_column_type=True
+    )
+    assert list(fast.columns) == list(up.columns)
+    assert fast.index.dtype == up.index.dtype
+    assert list(fast.dtypes) == list(up.dtypes)
+    assert fast_tally == up_tally
+    assert bool(up_tally) == positive  # the tally is part of what is compared
+    return up
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("zone_type", [int, np.int64, np.int32, float, str])
+@pytest.mark.parametrize("zone_count", [1, 7])
+@pytest.mark.parametrize("integer_dtype", [np.int64, np.float64])
+def test_reshape_result_fast_equals_upstream(
+    settings, positive, zone_type, zone_count, integer_dtype
+):
+    float_weights, integerized, names = _reshape_inputs(
+        zone_count, seed=zone_count, integer_dtype=integer_dtype
+    )
+    zones = _zones(names, zone_type)
+    values = float_weights.to_numpy()
+    assert (values > 0).any() and (values == 0).any()  # the filter has work to do
+    _assert_reshape_equal(settings, float_weights, integerized, zones, positive)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+def test_reshape_result_fast_keeps_an_all_zero_zone(settings, positive):
+    float_weights, integerized, names = _reshape_inputs(5, seed=3, zero_zone=2)
+    result = _assert_reshape_equal(
+        settings, float_weights, integerized, _zones(names, int), positive
+    )
+    assert (result["TAZ"] == 16).sum() == (0 if positive else 40)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("zone_count", [1, 4])
+def test_reshape_result_fast_with_nothing_positive_keeps_the_dense_dtypes(
+    settings, positive, zone_count
+):
+    float_weights, integerized, names = _reshape_inputs(zone_count)
+    float_weights[:] = 0.0
+    integerized[:] = 0
+    result = _assert_reshape_equal(
+        settings, float_weights, integerized, _zones(names, int), positive
+    )
+    assert len(result.index) == (0 if positive else 40 * zone_count)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("id_kind", ["int64", "int32", "object", "descending"])
+def test_reshape_result_fast_keeps_the_household_id_dtype(settings, positive, id_kind):
+    float_weights, integerized, names = _reshape_inputs(3, seed=5)
+    if id_kind == "object":
+        index = pd.Index(["h%d" % i for i in range(40)], name="hh_id")
+    elif id_kind == "int32":
+        index = pd.Index(np.arange(40, 0, -1).astype(np.int32), name="hh_id")
+    elif id_kind == "descending":
+        index = pd.Index(np.arange(40, 0, -1), name="hh_id")
+    else:
+        index = pd.Index(np.arange(40, dtype=np.int64) * 7, name="hh_id")
+    float_weights.index = index
+    integerized.index = index
+    _assert_reshape_equal(
+        settings, float_weights, integerized, _zones(names, int), positive
+    )
+
+
+def test_reshape_result_fast_repeated_zone_id_overwrites_its_tally_entry(settings):
+    float_weights, integerized, names = _reshape_inputs(3, seed=8)
+    zones = pd.Series(names, index=[10, 20, 10])
+    _assert_reshape_equal(settings, float_weights, integerized, zones, True)
+
+
+# an integer weight table cannot hold NaN (astype(int) refuses it), so no such case
+@pytest.mark.parametrize(
+    "bad, column", [(np.nan, "float"), (-1.0, "float"), (-1.0, "integer")]
+)
+@pytest.mark.parametrize("bad_zone", [0, 2])
+def test_reshape_result_fast_raises_the_upstream_error_and_leaves_its_tally(
+    settings, bad, column, bad_zone
+):
+    float_weights, integerized, names = _reshape_inputs(4, seed=2)
+    if column == "float":
+        float_weights.iloc[3, bad_zone] = bad
+    else:
+        integerized.iloc[3, bad_zone] = bad
+    # a second, later offender must not change which zone is reported
+    float_weights.iloc[5, 3] = -2.0
+    zones = _zones(names, int)
+
+    outcomes = []
+    for fast in (False, True):
+        try:
+            _run_reshape(settings, fast, float_weights, integerized, zones, True)
+        except ValueError as error:
+            outcomes.append(str(error))
+    assert len(outcomes) == 2 and outcomes[0] == outcomes[1]
+    assert "zone %d " % (10 + 3 * bad_zone) in outcomes[0]
+
+
+def _tally_after_error(settings, fast, float_weights, integerized, zones):
+    from populationsim.core import positive_weight_rows as pwr
+    from populationsim.integerizing import wrappers as iw
+
+    pwr._TALLY.clear()
+    settings.update({SETTING: False, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": True})
+    try:
+        with pytest.raises(ValueError):
+            if fast:
+                iw._reshape_result_fast(float_weights, integerized, "TAZ", zones, True)
+            else:
+                iw.reshape_result(float_weights, integerized, "TAZ", zones)
+        return dict(pwr._TALLY)
+    finally:
+        pwr._TALLY.clear()
+
+
+@pytest.mark.parametrize("bad_zone", [0, 1, 3])
+def test_reshape_result_fast_counts_the_zones_before_an_offender_like_upstream(
+    settings, bad_zone
+):
+    float_weights, integerized, names = _reshape_inputs(4, seed=2)
+    float_weights.iloc[3, bad_zone] = np.nan
+    zones = _zones(names, int)
+    upstream = _tally_after_error(settings, False, float_weights, integerized, zones)
+    fast = _tally_after_error(settings, True, float_weights, integerized, zones)
+    assert len(upstream) == bad_zone
+    assert fast == upstream
+
+
+def _tally_of_failing_call(settings, fast, float_weights, integerized, zones, positive):
+    from populationsim.core import positive_weight_rows as pwr
+    from populationsim.integerizing import wrappers as iw
+
+    pwr._TALLY.clear()
+    settings.clear()
+    settings.update({SETTING: False, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+    try:
+        with pytest.raises(Exception) as error:
+            if fast:
+                iw._reshape_result_fast(
+                    float_weights, integerized, "TAZ", zones, positive
+                )
+            else:
+                iw.reshape_result(float_weights, integerized, "TAZ", zones)
+        return type(error.value), str(error.value), dict(pwr._TALLY)
+    finally:
+        pwr._TALLY.clear()
+
+
+@pytest.mark.parametrize("positive", [False, True])
+@pytest.mark.parametrize("bad_zone", [0, 2, 3])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_reshape_result_fast_integer_cast_error_and_tally_are_upstreams(
+    settings, positive, bad_zone, bad
+):
+    """A float integerized_weights table with a value astype(int) refuses: upstream
+    casts zone by zone, so the zones before it are tallied and its error is raised."""
+    float_weights, integerized, names = _reshape_inputs(
+        4, seed=2, integer_dtype=np.float64
+    )
+    integerized.iloc[5, bad_zone] = bad
+    zones = _zones(names, int)
+    upstream = _tally_of_failing_call(
+        settings, False, float_weights, integerized, zones, positive
+    )
+    fast = _tally_of_failing_call(
+        settings, True, float_weights, integerized, zones, positive
+    )
+    assert fast == upstream
+    assert "non-finite" in upstream[1]
+    assert len(upstream[2]) == (bad_zone if positive else 0)
+
+
+def test_reshape_result_fast_invalid_weight_before_a_cast_error_wins_like_upstream(
+    settings,
+):
+    float_weights, integerized, names = _reshape_inputs(
+        4, seed=2, integer_dtype=np.float64
+    )
+    float_weights.iloc[3, 1] = -1.0  # zone 1: negative balanced weight
+    integerized.iloc[5, 2] = np.nan  # zone 2: not castable
+    zones = _zones(names, int)
+    upstream = _tally_of_failing_call(
+        settings, False, float_weights, integerized, zones, True
+    )
+    fast = _tally_of_failing_call(
+        settings, True, float_weights, integerized, zones, True
+    )
+    assert "negative" in upstream[1] and len(upstream[2]) == 1
+    assert fast == upstream
+    # and the other way round: the cast error of zone 1 comes before zone 2's NaN
+    float_weights.iloc[3, 1] = 0.0
+    float_weights.iloc[3, 2] = np.nan
+    integerized.iloc[5, 1] = np.nan
+    upstream = _tally_of_failing_call(
+        settings, False, float_weights, integerized, zones, True
+    )
+    fast = _tally_of_failing_call(
+        settings, True, float_weights, integerized, zones, True
+    )
+    assert "non-finite" in upstream[1] and len(upstream[2]) == 1
+    assert fast == upstream
+
+
+def test_reshape_result_fast_checks_columns_in_upstream_order(settings):
+    """Within a zone: balanced_weight before integer_weight, NaN before negative."""
+    float_weights, integerized, names = _reshape_inputs(3, seed=4)
+    zones = _zones(names, int)
+    float_weights.iloc[2, 1] = -1.0
+    integerized.iloc[3, 1] = -1
+    messages = []
+    for fast in (False, True):
+        try:
+            _run_reshape(settings, fast, float_weights, integerized, zones, True)
+        except ValueError as error:
+            messages.append(str(error))
+    assert len(messages) == 2 and messages[0] == messages[1]
+    assert "column balanced_weight" in messages[0] and "negative" in messages[0]
+
+    float_weights.iloc[2, 1] = 0.0
+    float_weights.iloc[4, 1] = np.nan
+    integerized.iloc[3, 1] = -1
+    messages = []
+    for fast in (False, True):
+        try:
+            _run_reshape(settings, fast, float_weights, integerized, zones, True)
+        except ValueError as error:
+            messages.append(str(error))
+    assert len(messages) == 2 and messages[0] == messages[1]
+    assert "NaN" in messages[0]
+
+
+def test_reshape_result_dispatches_on_fast_paths(settings, monkeypatch):
+    from populationsim.integerizing import wrappers as iw
+
+    float_weights, integerized, names = _reshape_inputs(3, seed=6)
+    zones = _zones(names, int)
+    calls = []
+    real = iw._reshape_result_fast
+
+    def spy(*args):
+        calls.append(args[-1])
+        return real(*args)
+
+    monkeypatch.setattr(iw, "_reshape_result_fast", spy)
+    for fast, positive in [(False, False), (True, False), (True, True)]:
+        settings.clear()
+        settings.update({SETTING: fast, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+        iw.reshape_result(float_weights, integerized, "TAZ", zones)
+    assert calls == [False, True]
+
+
+@pytest.mark.parametrize("positive", [False, True])
+def test_reshape_result_without_households_is_the_upstream_result(settings, positive):
+    """No rows: equal to upstream (the upstream loop builds it)."""
+    from populationsim.integerizing import wrappers as iw
+
+    float_weights, integerized, names = _reshape_inputs(2, seed=1)
+    zones = _zones(names, int)
+    results = []
+    for fast in (True, False):
+        settings.clear()
+        settings.update({SETTING: fast, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+        results.append(
+            iw.reshape_result(
+                float_weights.iloc[:0], integerized.iloc[:0], "TAZ", zones
+            )
+        )
+    pd.testing.assert_frame_equal(results[0], results[1], check_exact=True)
+
+
+@pytest.mark.parametrize("positive", [False, True])
+def test_reshape_result_without_zones_fails_like_upstream(settings, positive):
+    from populationsim.integerizing import wrappers as iw
+
+    float_weights, integerized, _ = _reshape_inputs(2, seed=1)
+    zones = _zones([], int)
+    errors = []
+    for fast in (True, False):
+        settings.clear()
+        settings.update({SETTING: fast, "STORE_POSITIVE_WEIGHT_ROWS_ONLY": positive})
+        with pytest.raises((ValueError, IndexError)) as error:
+            iw.reshape_result(float_weights[[]], integerized[[]], "TAZ", zones)
+        errors.append((type(error.value), str(error.value)))
+    assert errors[0] == errors[1]

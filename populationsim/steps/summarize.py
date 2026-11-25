@@ -25,8 +25,10 @@ class _DenseLayout:
     row: the (seed, parent, zone) keys of
     :func:`populationsim.core.positive_weight_rows.dense_zone_keys`, and the
     households of the seed zones among them. A household or zone the dense
-    table did not hold (never balanced at this geography) stays missing, as with
-    the setting off. Stored rows outside the dense keys raise.
+    table did not hold (never balanced at this geography) is not filled by the
+    layout, as with the setting off (``summarize_geography`` then gives such a
+    controlled zone result 0 in both cases). Stored rows outside the dense keys
+    raise.
     """
 
     def __init__(self, geography, weights_df, crosswalk_df, incidence_df):
@@ -154,6 +156,11 @@ def summarize_geography(
 
     Fork: ``layout`` (:class:`_DenseLayout`, only with
     ``STORE_POSITIVE_WEIGHT_ROWS_ONLY``) fills the zones the dense table held.
+
+    Fork: the rows are the controlled zones in the order of the control table;
+    ``_result`` and ``_diff = _result - _control`` are aligned to them by zone
+    id (upstream subtracted the sorted results by position). A controlled zone
+    without weight rows gets result 0.
     """
 
     # controls_table for current geography level
@@ -179,11 +186,18 @@ def summarize_geography(
         [np.transpose(np.transpose(incidence) * weights), geo_vec]
     )
 
-    # If empty, fill with zeros
+    # If empty, fill with zeros. Fork: no rows here; every zone gets result 0
+    # from the reindex below, in the dtype the non-empty product gives (that of
+    # incidence x weights next to the geography column; an empty product is
+    # float64 whatever its inputs).
     if results.size == 0:
-        results = np.zeros((1, results.shape[1]))
+        result_dtype = np.result_type(
+            *incidence_df[control_names].dtypes,
+            results_df[weight_col].dtype,
+            results_df[geography].dtype,
+        )
+        results = np.zeros((0, len(control_names) + 1), dtype=result_dtype)
 
-    logger.info("summarizing %s" % geography)
     controls = [controls_table.loc[x].tolist() for x in zone_ids]
 
     summary_df = (
@@ -197,6 +211,30 @@ def summarize_geography(
         summary_df = _zero_filled_zones(
             summary_df, zone_ids, layout.zone_ids(geography)
         )
+
+    # Fork: align the results to the controls by zone id. ``groupby`` gives the
+    # zones sorted, the controls are in the order of the control table, and the
+    # difference below is taken by position. A zone with controls but no weight
+    # rows gets result 0 (as the all-empty case above), so its diff is -control:
+    # a default when data is absent, logged as a rate (a warning when it fires).
+    # Counted after the layout fill, so the count is that of the dense table.
+    n_zones = len(zone_ids)
+    in_table = int(zone_ids.isin(summary_df.index).sum())
+    missing = n_zones - in_table
+    logger.log(
+        logging.WARNING if missing > 0 else logging.INFO,
+        "[summarize] %s: zones in the weight table %d/%d (%.1f %%), "
+        "missing %d (%.1f %%) filled with result 0"
+        % (
+            geography,
+            in_table,
+            n_zones,
+            100.0 * in_table / n_zones if n_zones else 0.0,
+            missing,
+            100.0 * missing / n_zones if n_zones else 0.0,
+        ),
+    )
+    summary_df = summary_df.reindex(zone_ids, fill_value=0)
 
     controls_df = pd.DataFrame(
         data=np.asanyarray(controls),
@@ -311,8 +349,11 @@ def summarize(crosswalk, incidence_table, control_spec):
     Fork: with ``STORE_POSITIVE_WEIGHT_ROWS_ONLY`` the sub-geography weight tables
     hold only their positive rows; the step fills zeros for the households and
     zones the dense table held (:class:`_DenseLayout`), so the summary tables have
-    the rows and columns of a run with the setting off and a household or zone
-    that was never balanced stays missing. A zero term adds nothing to an exact
+    the rows and columns of a run with the setting off and a household that was
+    never balanced stays missing. A zone summary (``summarize_geography``) has
+    one row per zone of the control table that occurs in the crosswalk, with
+    result 0 for a zone without weight rows (logged as a warning), with the
+    setting off as on. A zero term adds nothing to an exact
     sum, but pandas' grouped sum is compensated, so dropping the zero rows can
     change the last bit of a float sum: the summary tables can differ from those
     of a run with the setting off in the last bits of float sums (equal in the

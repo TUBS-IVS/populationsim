@@ -132,11 +132,16 @@ numba variants of the two release tests.
   or integer weight is positive (upstream stores one row per seed household group for every zone, almost all
   with weight 0); the next geography rebuilds the full parent weight vector. A line `[positive weight rows]`
   per table says how many rows were kept. The seed-geography table is never filtered.
-- `FAST_PATHS`: faster implementations of the upstream result: the numba balancers look up
+- `FAST_PATHS`: implementations aimed at run time, with the result of the upstream path: the numba balancers look up
   `exp(log_gamma * incidence)` per distinct incidence value, the single integerizer builds its OR-Tools model by
   setting only the non-zero coefficients (OR-Tools only: with `USE_CVXPY: true` it does not apply, which is
-  logged once), and the household expansion builds its draw lists only for the groups it uses (the used group
-  ids are cast to the dtype of the group column first; a cast that changes an id is refused).
+  logged once), and the household expansion takes all draws of the step in one batch, from the same random numbers in the
+  same order as upstream's per-row choice, building the household lists only for the groups it uses (the used
+  group ids are cast to the dtype of the group column first; a cast that changes an id is refused; invalid
+  sample weights raise a `ValueError` that names the group, where upstream fails inside `RandomState.choice`; with float32 sample weights upstream's `choice` can
+  raise "probabilities do not sum to 1" on a large group, the fast draw does not),
+  and the integerizers' per-zone result frames are built in one pass over whole arrays instead of one small
+  `DataFrame` per zone (same frame, index, dtypes and positive-row tally and errors).
 
 What differs from a run with the options off: the stored weight tables (`<geography>_weights`) and the
 `trace_<geography>_weights` tables hold only the positive rows, and the `delta` of a fast balancer call may

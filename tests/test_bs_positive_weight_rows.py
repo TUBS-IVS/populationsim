@@ -20,8 +20,14 @@ from populationsim.core import positive_weight_rows as pwr
 from populationsim.integerizing import wrappers
 from tests.bs_differential import REPO_ROOT, run_example
 from tests.settings_isolation import patch_settings
-
-SETTING = "STORE_POSITIVE_WEIGHT_ROWS_ONLY"
+from tests.summary_helpers import (
+    GEOGRAPHIES,
+    SETTING,
+    Table,
+    positive_rows,
+    run_summarize,
+    summarize_problem,
+)
 
 
 @pytest.fixture
@@ -138,19 +144,12 @@ def _sub_weights(all_zero_zone=True):
     return float_weights, integerized, zones
 
 
-def _positive(df):
-    mask = df["balanced_weight"] > 0
-    if "integer_weight" in df:
-        mask = mask | (df["integer_weight"] > 0)
-    return df[mask]
-
-
 def test_reshape_result_on_equals_positive_rows_of_off(settings):
     float_weights, integerized, zones = _sub_weights()
     off = wrappers.reshape_result(float_weights, integerized, "TAZ", zones)
     settings[SETTING] = True
     on = wrappers.reshape_result(float_weights, integerized, "TAZ", zones)
-    pd.testing.assert_frame_equal(on, _positive(off))
+    pd.testing.assert_frame_equal(on, positive_rows(off))
     assert 2 not in set(on["TAZ"]), "the all-zero zone must be dropped"
     assert len(off) == 15 and len(on) == 4
 
@@ -180,7 +179,7 @@ def test_no_integerizing_on_equals_positive_rows_of_off(settings):
     off = wrappers.do_no_integerizing(float_weights, zones, "TAZ")
     settings[SETTING] = True
     on = wrappers.do_no_integerizing(float_weights, zones, "TAZ")
-    pd.testing.assert_frame_equal(on, _positive(off))
+    pd.testing.assert_frame_equal(on, positive_rows(off))
     assert len(on) == 4
 
 
@@ -269,16 +268,6 @@ def test_rebuild_refuses_households_of_another_seed_zone():
 
 # --- sub_balancing on a small problem ---------------------------------------------
 
-GEOGRAPHIES = ["REGION", "PUMA", "TRACT", "TAZ"]
-
-
-class _Table:
-    def __init__(self, df):
-        self.df = df
-
-    def to_frame(self):
-        return self.df.copy()
-
 
 def _sub_balancing_problem(tract_weights):
     """Seed zone PUMA 1 with six households; TAZ 1 and 2 in TRACT 10, TAZ 3 in
@@ -357,7 +346,7 @@ def _run_sub_balancing(monkeypatch, settings, problem, positive_only, stored=Non
     )
     monkeypatch.setattr(step, "get_control_table", lambda g: controls[g])
     monkeypatch.setattr(step, "get_weight_table", lambda g, sparse=False: tract.copy())
-    step.sub_balancing(settings, _Table(crosswalk), _Table(spec), _Table(incidence))
+    step.sub_balancing(settings, Table(crosswalk), Table(spec), Table(incidence))
     return added
 
 
@@ -421,7 +410,7 @@ def test_sub_balancing_on_equals_off(monkeypatch, settings, module_log, integeri
     on = _run_sub_balancing(monkeypatch, settings, problem, True)
     assert len(on["TAZ_weights"]) < len(off["TAZ_weights"]) == 18
     pd.testing.assert_frame_equal(
-        on["TAZ_weights"], _positive(off["TAZ_weights"]), check_exact=True
+        on["TAZ_weights"], positive_rows(off["TAZ_weights"]), check_exact=True
     )
     if "TAZ_weights_sparse" in off:
         pd.testing.assert_frame_equal(
@@ -496,120 +485,12 @@ def test_sub_balancing_refuses_controlled_rounding_without_the_simul_integerizer
 # --- summarize --------------------------------------------------------------------
 
 
-def _summarize_problem():
-    """PUMA 1 (households 1-6) holds TRACT 10 (TAZ 1, 2) and TRACT 11 (TAZ 3);
-    PUMA 2 (households 7-9) holds TRACT 12 (TAZ 4), whose controls are zero, so
-    none of its zones is balanced and its households have no dense row. TRACT 11
-    and TAZ 2 have only zero weights."""
-    hh = pd.Index(range(1, 10), name="hh_id", dtype=np.int64)
-    incidence = pd.DataFrame(
-        {
-            "num_hh": 1,
-            "hh_size_1": [1, 0, 1, 0, 0, 1, 1, 0, 1],
-            "PUMA": [1] * 6 + [2] * 3,
-            "REGION": 1,
-            "sample_weight": 10.0,
-        },
-        index=hh,
-    )
-    crosswalk = pd.DataFrame(
-        {"TAZ": [1, 2, 3, 4], "TRACT": [10, 10, 11, 12], "PUMA": [1, 1, 1, 2]}
-    )
-    crosswalk["REGION"] = 1
-    spec = pd.DataFrame(
-        {
-            "target": ["num_hh", "hh_size_1"],
-            "geography": ["TAZ", "TAZ"],
-            "seed_table": "households",
-            "importance": [1000000, 1000],
-            "control_field": ["HHS", "HH1"],
-        }
-    )
-
-    def controls(name, ids, num_hh, size_1):
-        return pd.DataFrame(
-            {"num_hh": num_hh, "hh_size_1": size_1},
-            index=pd.Index(ids, name=name, dtype=np.int64),
-        )
-
-    control_tables = {
-        "TAZ": controls("TAZ", [1, 2, 3], [5, 3, 4], [2, 1, 1]),
-        "TRACT": controls("TRACT", [10, 11], [8, 4], [3, 1]),
-        "PUMA": controls("PUMA", [1], [12], [4]),
-        "REGION": controls("REGION", [1], [12], [4]),
-    }
-    seed = pd.DataFrame(
-        {
-            "preliminary_balanced_weight": np.linspace(0.5, 4.5, 9),
-            "balanced_weight": np.linspace(0.25, 4.25, 9),
-            "integer_weight": np.array([1, 0, 2, 3, 1, 4, 0, 0, 0]),
-        },
-        index=hh,
-    )
-    seed["PUMA"] = incidence["PUMA"]
-    rng = np.random.default_rng(7)
-
-    def dense(geography, zones):
-        frames = []
-        for zone, parent, zero in zones:
-            df = pd.DataFrame(index=list(range(0, 6)))
-            df["hh_id"] = hh.values[:6]
-            df[geography] = zone
-            weights = rng.uniform(0.1, 3.0, 6) * (rng.uniform(size=6) > 0.4)
-            df["balanced_weight"] = 0.0 if zero else weights
-            df["integer_weight"] = np.round(0.0 * weights if zero else weights).astype(
-                int
-            )
-            if geography == "TAZ":
-                df["TRACT"] = parent
-            df["REGION"] = 1
-            df["PUMA"] = 1
-            frames.append(df)
-        return pd.concat(frames)
-
-    weights = {
-        "PUMA": seed,
-        "TRACT": dense("TRACT", [(10, 1, False), (11, 1, True)]),
-        "TAZ": dense("TAZ", [(1, 10, False), (2, 10, True), (3, 11, False)]),
-    }
-    return incidence, crosswalk, spec, control_tables, weights
-
-
-def _run_summarize(monkeypatch, settings, problem, positive_only):
-    from populationsim.core import inject
-    from populationsim.steps import summarize as step
-
-    incidence, crosswalk, spec, control_tables, weights = problem
-    settings.update(
-        {
-            "geographies": GEOGRAPHIES,
-            "seed_geography": "PUMA",
-            "household_id_col": "hh_id",
-            "total_hh_control": "num_hh",
-            SETTING: positive_only,
-        }
-    )
-    stored = dict(weights)
-    if positive_only:
-        for g in ("TRACT", "TAZ"):
-            stored[g] = _positive(weights[g])
-    out = {}
-    monkeypatch.setattr(inject, "get_step_arg", lambda name, default=None: default)
-    monkeypatch.setattr(step, "get_control_table", lambda g: control_tables[g])
-    monkeypatch.setattr(
-        step, "get_weight_table", lambda g, sparse=False: stored[g].copy()
-    )
-    monkeypatch.setattr(step, "out_table", lambda name, df: out.__setitem__(name, df))
-    step.summarize(_Table(crosswalk), _Table(incidence), spec)
-    return out
-
-
 def test_summarize_on_equals_off_and_keeps_unbalanced_households_missing(
     monkeypatch, settings
 ):
-    problem = _summarize_problem()
-    off = _run_summarize(monkeypatch, settings, problem, False)
-    on = _run_summarize(monkeypatch, settings, problem, True)
+    problem = summarize_problem()
+    off = run_summarize(monkeypatch, settings, problem, False)
+    on = run_summarize(monkeypatch, settings, problem, True)
     assert sorted(on) == sorted(off)
     for name in off:
         pd.testing.assert_frame_equal(on[name], off[name], check_exact=True)
@@ -623,11 +504,11 @@ def test_summarize_on_equals_off_and_keeps_unbalanced_households_missing(
 def test_summarize_on_refuses_stored_rows_outside_the_dense_table(
     monkeypatch, settings
 ):
-    problem = _summarize_problem()
+    problem = summarize_problem()
     taz = problem[-1]["TAZ"]
     taz.loc[taz["TAZ"] == 3, "TRACT"] = 10  # TAZ 3 does not lie in TRACT 10
     with pytest.raises(RuntimeError, match="TAZ_weights"):
-        _run_summarize(monkeypatch, settings, problem, True)
+        run_summarize(monkeypatch, settings, problem, True)
 
 
 # --- the rate line ----------------------------------------------------------------
@@ -799,7 +680,7 @@ def test_every_simul_integerizing_path_stores_the_positive_rows_of_off(
     assert len(off) == 15
     settings[SETTING] = True
     on = _run_simul_path(monkeypatch, path)
-    pd.testing.assert_frame_equal(on, _positive(off), check_exact=True)
+    pd.testing.assert_frame_equal(on, positive_rows(off), check_exact=True)
     assert len(on) < len(off)
     kept_total = pwr.log_row_tally("TAZ", stored_rows=len(on), dense_rows=len(off))
     assert kept_total == (len(on), len(off))
@@ -874,7 +755,7 @@ def test_example_on_equals_off(tmp_path, variant):
             off_dense = _final_table(off_store, name)
             on_dense = _final_table(on_store, name)
             pd.testing.assert_frame_equal(
-                on_dense, _positive(off_dense), check_exact=True
+                on_dense, positive_rows(off_dense), check_exact=True
             )
             rows[geography] = (len(on_dense), len(off_dense))
             dropped += len(off_dense) - len(on_dense)
@@ -887,7 +768,7 @@ def test_example_on_equals_off(tmp_path, variant):
             trace = f"trace_{name}"
             pd.testing.assert_frame_equal(
                 _final_table(on_store, trace),
-                _positive(_final_table(off_store, trace)),
+                positive_rows(_final_table(off_store, trace)),
                 check_exact=True,
             )
         assert dropped > 0, "the example must have zero rows to drop"
@@ -1038,7 +919,7 @@ def test_multiprocess_example_on_equals_off_and_reports_the_coalesced_table(
             off_dense = _final_table(off_store, name)
             on_dense = _final_table(on_store, name)
             pd.testing.assert_frame_equal(
-                on_dense, _positive(off_dense), check_exact=True
+                on_dense, positive_rows(off_dense), check_exact=True
             )
             pd.testing.assert_frame_equal(
                 _final_table(on_store, name + "_sparse"),
