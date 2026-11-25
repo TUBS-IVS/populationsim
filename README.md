@@ -138,7 +138,9 @@ numba variants of the two release tests.
   logged once), and the household expansion takes all draws of the step in one batch, from the same random numbers in the
   same order as upstream's per-row choice, building the household lists only for the groups it uses (the used
   group ids are cast to the dtype of the group column first; a cast that changes an id is refused; invalid
-  sample weights raise a `ValueError` that names the group, where upstream fails inside `RandomState.choice`).
+  sample weights raise a `ValueError` that names the group, where upstream fails inside `RandomState.choice`),
+  and the integerizers' per-zone result frames are built in one pass over whole arrays instead of one small
+  `DataFrame` per zone (same frame, index, dtypes and positive-row tally and errors).
 
 What differs from a run with the options off: the stored weight tables (`<geography>_weights`) and the
 `trace_<geography>_weights` tables hold only the positive rows, and the `delta` of a fast balancer call may
