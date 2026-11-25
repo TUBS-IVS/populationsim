@@ -40,6 +40,10 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
     ``np.asarray(list(ids of a group))`` (the common dtype if groups differ),
     derived the same way, so the table is equal in dtype on every platform.
 
+    No rows. An empty ``group_ids`` returns an empty array of the dtype of
+    ``group_ids`` (what upstream's ``apply`` on an empty Series gives) and draws
+    nothing.
+
     Differences in failure. Upstream fails inside ``choice`` on probabilities
     that are negative or do not sum to 1, and not at all on NaN; a group whose
     weights are not finite, are negative or sum to 0 raises a ``ValueError`` that
@@ -68,7 +72,8 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
         household id of each row of ``group_ids``
     """
     group_col = household_groups["group_id"].to_numpy()
-    codes, used = pd.factorize(np.asarray(group_ids, dtype=object))
+    group_ids = np.asarray(group_ids)
+    codes, used = pd.factorize(group_ids.astype(object))
     if (codes < 0).any():
         raise ValueError(
             "expand_households: a group id is missing (NaN) in the expanded weights"
@@ -92,6 +97,8 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
     lower = np.searchsorted(sorted_groups, converted, side="left")
     upper = np.searchsorted(sorted_groups, converted, side="right")
 
+    # Groups are checked in the order of their first row, so the group named in
+    # an error is the one upstream's per-row choice reaches first and fails on.
     cdfs = []
     donors = []
     ids = household_groups[household_id_col]
@@ -116,7 +123,11 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
         cdfs.append(cdf)
         donors.append(np.asarray(list(ids.iloc[rows])))
 
-    result_dtype = np.result_type(*[d.dtype for d in donors]) if donors else np.int64
+    # No row: upstream's apply of the chooser on an empty Series returns a Series
+    # of the dtype of the group id Series; so does this.
+    result_dtype = (
+        np.result_type(*[d.dtype for d in donors]) if donors else group_ids.dtype
+    )
     uniforms = rng.random_sample(len(codes))
     chosen = np.empty(len(codes), dtype=result_dtype)
     by_group = np.argsort(codes, kind="stable")

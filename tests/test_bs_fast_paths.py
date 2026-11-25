@@ -589,6 +589,55 @@ def test_fast_draw_keeps_upstream_id_dtype(monkeypatch, id_offset):
     _assert_same_rng_state(on_rng, off_rng)
 
 
+@pytest.mark.parametrize("dtype", [object, np.int64, np.float64])
+def test_fast_draw_of_no_rows_has_the_dtype_of_the_upstream_result(dtype):
+    """With no expanded row upstream's apply returns an empty Series of the dtype
+    of the group id Series (object in the step); the fast draw does the same and
+    draws nothing."""
+    household_groups, _ = _expansion_tables(50, 5, seed=2)
+    group_ids = np.array([], dtype=dtype)
+    expected = _upstream_draw(household_groups, group_ids, np.random.RandomState(3))
+    rng = np.random.RandomState(3)
+    got = eh.draw_household_ids(group_ids, household_groups, "hh_id", rng)
+    assert len(got) == 0
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(rng, np.random.RandomState(3))
+
+
+def test_expansion_with_no_rows_is_equal_on_and_off(monkeypatch):
+    household_groups, weights = _expansion_tables(50, 5, seed=2)
+    weights = weights.iloc[:0]
+    off, off_rng = _run_expand(monkeypatch, household_groups, weights, fast=False)
+    on, on_rng = _run_expand(monkeypatch, household_groups, weights, fast=True)
+    assert len(on) == 0
+    assert on["hh_id"].dtype == off["hh_id"].dtype
+    _assert_same_table(on, off)
+    _assert_same_rng_state(on_rng, off_rng)
+
+
+def test_fast_draw_names_the_first_invalid_group_in_row_order():
+    """Upstream's per-row choice fails at the first row whose group is invalid;
+    the group named is the one of that row, not the lowest id or the last one."""
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [1, 2, 3, 4, 5],
+            "group_id": [4, 5, 6, 7, 7],
+            "sample_weight": [0.0, 1.0, -1.0, 1.0, 1.0],
+        }
+    )
+    rng = np.random.RandomState(1)
+    with pytest.raises(ValueError, match="group 6"):
+        eh.draw_household_ids(
+            pd.Series([7, 5, 6, 4, 6]), household_groups, "hh_id", rng
+        )
+    with pytest.raises(ValueError, match="group 4"):
+        eh.draw_household_ids(pd.Series([7, 4, 6, 5]), household_groups, "hh_id", rng)
+    # a group without households counts the same way
+    with pytest.raises(ValueError, match="group 99"):
+        eh.draw_household_ids(pd.Series([5, 99, 6]), household_groups, "hh_id", rng)
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
 def test_expansion_off_path_does_not_use_the_fast_draw(monkeypatch):
     household_groups, weights = _expansion_tables(100, 10, seed=7)
 
