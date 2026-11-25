@@ -135,8 +135,10 @@ numba variants of the two release tests.
 - `FAST_PATHS`: faster implementations of the upstream result: the numba balancers look up
   `exp(log_gamma * incidence)` per distinct incidence value, the single integerizer builds its OR-Tools model by
   setting only the non-zero coefficients (OR-Tools only: with `USE_CVXPY: true` it does not apply, which is
-  logged once), and the household expansion builds its draw lists only for the groups it uses (the used group
-  ids are cast to the dtype of the group column first; a cast that changes an id is refused).
+  logged once), and the household expansion takes all draws of the step in one batch, from the same random numbers in the
+  same order as upstream's per-row choice, building the household lists only for the groups it uses (the used
+  group ids are cast to the dtype of the group column first; a cast that changes an id is refused; invalid
+  sample weights raise a `ValueError` that names the group, where upstream fails inside `RandomState.choice`).
 
 What differs from a run with the options off: the stored weight tables (`<geography>_weights`) and the
 `trace_<geography>_weights` tables hold only the positive rows, and the `delta` of a fast balancer call may

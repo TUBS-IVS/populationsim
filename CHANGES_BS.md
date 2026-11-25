@@ -4,6 +4,7 @@ Base: upstream tag `v0.10.0`. Every new setting defaults to upstream behaviour.
 
 ## 0.10.0+bs.3 (unreleased)
 
+- `FAST_PATHS`: the household expansion (`expand_households`, `GROUP_BY_INCIDENCE_SIGNATURE`) now takes all draws in one batch (`draw_household_ids`) from the same random numbers in the same order as upstream's per-row `choice`, so the table and the generator state are unchanged; it replaces the lists-for-used-groups build of `0.10.0+bs.2`, which is removed.
 - Correct: `_diff` columns of the zone summaries were subtracted by position; now by zone id.
 - Correct: a zone of the control table that has no weight rows now gets a summary row with result 0 and diff = -control, and a warning with the share of such zones per geography. Before, the step stopped with a `ValueError`; with exactly one zone holding weight rows it silently took every zone's diff from that zone's result and left the other results empty (NaN); with no weight rows at all it left every result empty and added an extra zone `0` with empty controls, which turned every id and control into a float. That extra zone is gone, and the zero results keep the dtype of a summary with weight rows.
 - Correct: with float weights (`balanced_weight`, as with `NO_INTEGERIZATION_EVER: true`) and a control table that is not sorted, the zone ids of the summaries were floats (`zone_20.0`, id `20.0`); they are now integers (`zone_20`, `20`), as with a sorted control table.

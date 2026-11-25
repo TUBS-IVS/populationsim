@@ -447,56 +447,169 @@ def _assert_rng_advanced(rng):
     )
 
 
-def test_expansion_fast_lists_equal_upstream_lists():
-    """The per-group id and probability lists equal upstream's, for every used group."""
-    household_groups, weights = _expansion_tables(500, 40, seed=5)
-    upstream = {}
+def _upstream_draw(household_groups, group_ids, rng):
+    """Upstream's draw, as ``expand_households`` runs it with FAST_PATHS off."""
+    lists = {}
     for group_id, df in household_groups.groupby("group_id"):
-        upstream[group_id] = [
+        lists[group_id] = [
             list(df["hh_id"]),
             list(df.sample_weight / df.sample_weight.sum()),
         ]
-    used = weights["hh_id"].unique()
-    fast = eh.household_lists_for_groups(household_groups, used, "hh_id")
-    assert sorted(fast) == sorted(int(g) for g in used)
-    for group_id, (ids, probs) in fast.items():
-        assert ids == upstream[group_id][0]
-        assert [type(i) for i in ids] == [type(i) for i in upstream[group_id][0]]
-        assert np.array_equal(np.array(probs), np.array(upstream[group_id][1]))
-        assert [type(p) for p in probs] == [type(p) for p in upstream[group_id][1]]
+
+    def chooser(group_id):
+        return rng.choice(lists[group_id][0], p=lists[group_id][1])
+
+    return pd.Series(group_ids).apply(chooser)
 
 
-def _lists(household_groups, used):
-    lists = eh.household_lists_for_groups(household_groups, used, "hh_id")
-    return {int(group_id): value for group_id, value in lists.items()}
+@pytest.mark.parametrize("int_sample_weights", [False, True])
+def test_fast_draw_equals_upstream_choice(int_sample_weights):
+    """Same ids, same dtype and the same next random number as a per-row
+    ``RandomState.choice``, on groups that recur in many rows and have 1 to
+    20,000 households."""
+    household_groups, weights = _expansion_tables(
+        500, 40, seed=5, int_sample_weights=int_sample_weights
+    )
+    group_ids = np.repeat(
+        weights["hh_id"].to_numpy(), weights["integer_weight"].to_numpy()
+    )
+    group_ids = np.random.RandomState(1).permutation(np.tile(group_ids, 20))
+    upstream_rng = np.random.RandomState([11, 42])
+    fast_rng = np.random.RandomState([11, 42])
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    got = eh.draw_household_ids(
+        pd.Series(group_ids.astype(object)), household_groups, "hh_id", fast_rng
+    )
+    assert len(got) == len(group_ids) > 1000
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(fast_rng, upstream_rng)
+
+
+def test_fast_draw_takes_a_singleton_group_and_zero_weights_like_upstream():
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [10, 11, 12, 13, 14],
+            "group_id": [3, 0, 3, 3, 7],
+            "sample_weight": [0.5, 2.0, 0.0, 1.5, 4.0],
+        }
+    )
+    group_ids = np.array([3, 7, 0, 3, 3, 7, 7, 0, 3] * 50)
+    upstream_rng = np.random.RandomState(8)
+    fast_rng = np.random.RandomState(8)
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    got = eh.draw_household_ids(
+        pd.Series(group_ids), household_groups, "hh_id", fast_rng
+    )
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert 12 not in set(got.tolist())
+    _assert_same_rng_state(fast_rng, upstream_rng)
 
 
 @pytest.mark.parametrize("dtype", [object, np.float64, np.int32])
-def test_expansion_lists_do_not_depend_on_the_dtype_of_the_used_ids(dtype):
+def test_fast_draw_does_not_depend_on_the_dtype_of_the_group_ids(dtype):
     """The step hands over an object array of group ids (the expanded table is
     built from mixed dtypes); object, float and int ids select the same groups
-    and give the same lists as int64 ids."""
+    and draw the same households as int64 ids."""
     household_groups, weights = _expansion_tables(300, 30, seed=3)
     used = weights["hh_id"].to_numpy()
-    expected = _lists(household_groups, used)
-    assert len(expected) > 0
-    got = _lists(household_groups, used.astype(dtype))
-    assert list(got) == list(expected)
-    for group_id, (ids, probs) in expected.items():
-        assert got[group_id][0] == ids
-        assert np.array_equal(np.array(got[group_id][1]), np.array(probs))
+    reference = eh.draw_household_ids(
+        pd.Series(used), household_groups, "hh_id", np.random.RandomState(2)
+    )
+    got = eh.draw_household_ids(
+        pd.Series(used.astype(dtype)),
+        household_groups,
+        "hh_id",
+        np.random.RandomState(2),
+    )
+    np.testing.assert_array_equal(got, reference)
+    assert got.dtype == reference.dtype
 
 
 def test_expansion_refuses_a_group_id_the_cast_would_change():
     household_groups, weights = _expansion_tables(100, 10, seed=4)
     used = weights["hh_id"].to_numpy().astype(np.float64)
     used[0] = 2.5
+    rng = np.random.RandomState(1)
     with pytest.raises(ValueError, match="group id"):
-        eh.household_lists_for_groups(household_groups, used, "hh_id")
+        eh.draw_household_ids(pd.Series(used), household_groups, "hh_id", rng)
     with pytest.raises(ValueError, match="group id"):
-        eh.household_lists_for_groups(
-            household_groups, np.array([1, "x"], dtype=object), "hh_id"
+        eh.draw_household_ids(
+            pd.Series([1, "x"], dtype=object), household_groups, "hh_id", rng
         )
+    with pytest.raises(ValueError, match="group id"):
+        eh.draw_household_ids(
+            pd.Series([1.0, np.nan], dtype=object), household_groups, "hh_id", rng
+        )
+    # nothing was drawn before the refusal
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
+def test_fast_draw_refuses_a_group_without_households():
+    household_groups, weights = _expansion_tables(100, 10, seed=4)
+    rng = np.random.RandomState(1)
+    with pytest.raises(ValueError, match="group 100000"):
+        eh.draw_household_ids(pd.Series([100000]), household_groups, "hh_id", rng)
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
+@pytest.mark.parametrize(
+    "weights", [[0, 0], [-1, 2], [1, np.nan], [1, np.inf], [np.nan, np.nan]]
+)
+def test_fast_draw_names_a_group_with_invalid_weights(weights):
+    """Upstream fails inside ``RandomState.choice`` (a ValueError for negative or
+    non-normalised probabilities); the fast draw fails with a ValueError that
+    names the group, before it draws anything."""
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [1, 2, 3],
+            "group_id": [4, 4, 5],
+            "sample_weight": weights + [1.0],
+        }
+    )
+    rng = np.random.RandomState(1)
+    with pytest.raises(ValueError, match="group 4"):
+        eh.draw_household_ids(pd.Series([5, 4, 5]), household_groups, "hh_id", rng)
+    _assert_same_rng_state(rng, np.random.RandomState(1))
+
+
+@pytest.mark.parametrize("id_offset", [0, 2**40])
+def test_fast_draw_keeps_upstream_id_dtype(monkeypatch, id_offset):
+    """The fast draw returns the ``hh_id`` dtype the upstream path returns on this
+    platform (int32 on Windows with NumPy 1.x, which builds a Python list of ids
+    and lets ``RandomState.choice`` pick the default integer; int64 where the ids
+    do not fit), not the dtype of the id column."""
+    household_groups, weights = _expansion_tables(200, 20, seed=6)
+    household_groups["hh_id"] = household_groups["hh_id"] + id_offset
+    off, off_rng = _run_expand(monkeypatch, household_groups, weights, fast=False)
+    on, on_rng = _run_expand(monkeypatch, household_groups, weights, fast=True)
+    assert on["hh_id"].dtype == off["hh_id"].dtype
+    assert list(on.dtypes) == list(off.dtypes)
+    _assert_same_table(on, off)
+    _assert_same_rng_state(on_rng, off_rng)
+
+
+def test_expansion_off_path_does_not_use_the_fast_draw(monkeypatch):
+    household_groups, weights = _expansion_tables(100, 10, seed=7)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("draw_household_ids called with FAST_PATHS off")
+
+    monkeypatch.setattr(eh, "draw_household_ids", refuse)
+    off, _ = _run_expand(monkeypatch, household_groups, weights, fast=False)
+    assert len(off) == weights["integer_weight"].sum()
+    with pytest.raises(AssertionError, match="FAST_PATHS off"):
+        _run_expand(monkeypatch, household_groups, weights, fast=True)
+
+
+def test_expansion_fast_path_logs_its_batch(monkeypatch, caplog, fork_logging):
+    import logging
+
+    household_groups, weights = _expansion_tables(100, 10, seed=7)
+    with caplog.at_level(logging.INFO, logger=eh.logger.name):
+        _run_expand(monkeypatch, household_groups, weights, fast=True)
+    lines = [r.getMessage() for r in caplog.records if "FAST_PATHS" in r.getMessage()]
+    assert len(lines) == 1 and "batch" in lines[0]
 
 
 def test_expansion_without_grouping_is_unchanged(monkeypatch):
