@@ -584,6 +584,31 @@ def test_fast_draw_id_dtype_follows_upstream_for_the_used_groups(id_dtype, big_g
     assert got.dtype == expected.dtype
 
 
+def test_fast_draw_with_string_group_ids_equals_upstream_and_logs(caplog, fork_logging):
+    """A string group column (any dtype that sorts) works through the draw and
+    its log line, with the draws and the next random number of upstream's."""
+    import logging
+
+    household_groups = pd.DataFrame(
+        {
+            "hh_id": [10, 11, 12, 13, 14, 15],
+            "group_id": ["b", "a", "b", "c", "a", "b"],
+            "sample_weight": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    group_ids = np.array(["b", "c", "a", "b", "b", "a", "c"] * 20, dtype=object)
+    upstream_rng = np.random.RandomState(5)
+    fast_rng = np.random.RandomState(5)
+    expected = _upstream_draw(household_groups, group_ids, upstream_rng)
+    with caplog.at_level(logging.INFO, logger=eh.logger.name):
+        got = eh.draw_household_ids(group_ids, household_groups, "hh_id", fast_rng)
+    np.testing.assert_array_equal(got, expected.to_numpy())
+    assert got.dtype == expected.dtype
+    _assert_same_rng_state(fast_rng, upstream_rng)
+    lines = [r.getMessage() for r in caplog.records if "FAST_PATHS" in r.getMessage()]
+    assert len(lines) == 1 and "from 3 of 3 incidence groups" in lines[0]
+
+
 def test_fast_draw_takes_a_singleton_group_and_zero_weights_like_upstream():
     household_groups = pd.DataFrame(
         {

@@ -46,6 +46,12 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
     ``np.asarray(list(ids of a group))`` (the common dtype if groups differ),
     derived the same way, so the table is equal in dtype on every platform.
 
+    float32 weights. Upstream's ``choice`` checks that the float64 list of
+    probabilities sums to 1 within about 1.5e-8, which float32 probabilities of a
+    large group can miss, and then raises ``ValueError`` ("probabilities do not
+    sum to 1"); the fast draw does not check this. It divides in float32 like
+    upstream and casts to float64 before the cumulative sum, as ``choice`` does.
+
     No rows. An empty ``group_ids`` returns an empty array of the dtype of
     ``group_ids`` (what upstream's ``apply`` on an empty Series gives) and draws
     nothing.
@@ -173,7 +179,7 @@ def draw_household_ids(group_ids, household_groups, household_id_col, rng):
         % (
             len(codes),
             len(cdfs),
-            len(np.flatnonzero(np.diff(sorted_groups)) + 1) + 1 if len(order) else 0,
+            len(pd.unique(group_col)),
             result_dtype,
             id_dtype_path,
         )

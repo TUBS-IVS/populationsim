@@ -138,7 +138,8 @@ numba variants of the two release tests.
   logged once), and the household expansion takes all draws of the step in one batch, from the same random numbers in the
   same order as upstream's per-row choice, building the household lists only for the groups it uses (the used
   group ids are cast to the dtype of the group column first; a cast that changes an id is refused; invalid
-  sample weights raise a `ValueError` that names the group, where upstream fails inside `RandomState.choice`),
+  sample weights raise a `ValueError` that names the group, where upstream fails inside `RandomState.choice`; with float32 sample weights upstream's `choice` can
+  raise "probabilities do not sum to 1" on a large group, the fast draw does not),
   and the integerizers' per-zone result frames are built in one pass over whole arrays instead of one small
   `DataFrame` per zone (same frame, index, dtypes and positive-row tally and errors).
 
